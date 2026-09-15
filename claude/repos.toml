@@ -1,0 +1,6 @@
+# repos.toml — the jeirslab org fleet registry (ADR-012).
+# One [[repo]] per managed repository; the .github engine dogfoods itself.
+
+[[repo]]
+slug = "jeirslab/.github"
+description = "jeirslab org engine: reusable workflows, agent baseline, dev-env flake, ADRs"

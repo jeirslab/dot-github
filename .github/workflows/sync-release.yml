@@ -1,0 +1,399 @@
+name: Release on merge to main
+# @doc: Publishes a release when a PR merges into `main` or `master`: computes the next semver, tags the merge commit, and creates a GitHub Release with the changelog since the previous tag.
+# @doc: Refuses to run for any other event or base branch, so a direct push never releases; then verifies the merged PR had a non-author approval and the required org check runs (the ADR-007 substitute for rulesets). Then opens a back-merge PR into the integration branch and, when an API key and model variable exist, appends agent-drafted release notes. Reusable (`workflow_call`, outputs `tag`) and dispatchable on a deploy branch.
+#
+# INFRA-270 — replaces the v1 "fast-forward prod → main, then release" flow. Under the
+# v2 branch model (ideas.md → Emerging decisions; ADR-002 R14) `main`/`master` IS the
+# deploy branch and receives changes only through PRs from `staging`; there is nothing
+# to sync. The filename is kept so existing `sync-release.yml@v1` callers keep resolving;
+# for them the guard below turns a non-deploy-branch event into a no-op with a notice.
+
+on:
+  # Reusable entrypoint. The caller's event drives the guard: a merged PR into a deploy
+  # branch releases; anything else is a no-op.
+  workflow_call:
+    inputs:
+      version_bump:
+        description: 'patch | minor | major'
+        type: string
+        default: 'patch'
+        required: false
+      release_notes:
+        description: 'Custom release notes prepended to the changelog (optional)'
+        type: string
+        default: ''
+        required: false
+      deploy_branches:
+        description: 'Space-separated branches that count as deploy branches'
+        type: string
+        default: 'main master'
+        required: false
+      required_checks:
+        description: 'Comma-separated check-run names that must have succeeded on the PR head (ADR-007 substitute for rulesets)'
+        type: string
+        default: 'gate / gate,guardrails / secrets,guardrails / commits,guardrails / pr,guardrails / supply-chain'
+        required: false
+      min_approvals:
+        description: 'Approving reviews from someone other than the author required before a release'
+        type: number
+        default: 1
+        required: false
+    secrets:
+      ORG_READ_TOKEN:
+        required: false
+      ANTHROPIC_API_KEY:
+        description: 'Optional: enables the AI release-notes job (model from the ORG_RELEASE_NOTES_MODEL variable)'
+        required: false
+    outputs:
+      tag:
+        value: ${{ jobs.release.outputs.tag }}
+      released:
+        value: ${{ jobs.guard.outputs.proceed }}
+
+  # Manual: release the current head of the deploy branch you dispatch on.
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+        required: false
+      release_notes:
+        description: 'Custom release notes (optional)'
+        type: string
+        required: false
+        default: ''
+      min_approvals:
+        description: 'Non-author approvals required (0 for a solo / operator-dispatched release)'
+        type: number
+        required: false
+        default: 1
+      required_checks:
+        description: 'Comma-separated required check-runs (empty to skip — solo / operator dispatch)'
+        type: string
+        required: false
+        default: ''
+
+  # Automatic in this repository: a PR merged into main/master.
+  pull_request:
+    types: [closed]
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Confirm this is a merge into a deploy branch
+    # Kill switch (INFRA-273): automatic triggers are inert until the repository (or org)
+    # variable ORG_WORKFLOWS_ENABLED is set to 'true'. Manual dispatch always works.
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      ref: ${{ steps.check.outputs.ref }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - name: Evaluate the triggering event
+        id: check
+        env:
+          EVENT: ${{ github.event_name }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          REF_NAME: ${{ github.ref_name }}
+          HEAD_SHA: ${{ github.sha }}
+          ALLOWED: ${{ inputs.deploy_branches || 'main master' }}
+        run: |
+          set -euo pipefail
+          proceed=false; ref=""; sha=""; reason=""
+          is_deploy() { local b; for b in $ALLOWED; do [[ "$1" == "$b" ]] && return 0; done; return 1; }
+
+          case "$EVENT" in
+            pull_request)
+              if [[ "$MERGED" == "true" ]] && is_deploy "$BASE"; then
+                proceed=true; ref="$BASE"; sha="$MERGE_SHA"
+              else
+                reason="PR into '$BASE' closed without merging, or '$BASE' is not a deploy branch ($ALLOWED)"
+              fi ;;
+            workflow_dispatch)
+              if is_deploy "$REF_NAME"; then
+                proceed=true; ref="$REF_NAME"; sha="$HEAD_SHA"
+              else
+                reason="dispatched on '$REF_NAME', which is not a deploy branch ($ALLOWED)"
+              fi ;;
+            *)
+              reason="event '$EVENT' never releases — a release is a PR merged into a deploy branch, never a direct push" ;;
+          esac
+
+          if [[ "$proceed" == true ]]; then
+            echo "::notice title=Release::merge into '$ref' at $sha"
+          else
+            echo "::notice title=No release::$reason"
+          fi
+          {
+            echo "proceed=$proceed"
+            echo "ref=$ref"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify the merge was approved and gated (ADR-007)
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: Approvals, required check runs, code-owner approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          # Pass inputs through; resolve empties in shell. GH expressions make
+          # `x || default` wrong here: 0 and '' are both falsy, so an explicit
+          # min_approvals=0 or required_checks='' would be silently overridden.
+          REQUIRED: ${{ inputs.required_checks }}
+          MIN: ${{ inputs.min_approvals }}
+        run: |
+          MIN="${MIN:-1}"
+          # Automatic PR-merge release with no override → the standard check set.
+          # Operator dispatch with an explicit empty value → skip (test/manual).
+          if [ "$EVENT" = "pull_request" ] && [ -z "$REQUIRED" ]; then
+            REQUIRED="gate / gate,guardrails / secrets,guardrails / commits,guardrails / pr,guardrails / supply-chain"
+          fi
+          python3 .org/claude/hooks/verify_pr.py --repo "$GITHUB_REPOSITORY" --sha "${{ needs.guard.outputs.sha }}" --root . \
+            --required-checks "$REQUIRED" --min-approvals "$MIN" --dump || {
+            echo "::error::refusing to release: the merge into '${{ needs.guard.outputs.ref }}' was not an approved, gated pull request (see above). Land it through a PR from the integration branch."; exit 1; }
+
+  release:
+    name: Tag and publish release
+    needs: [guard, verify]
+    if: always() && needs.guard.outputs.proceed == 'true' && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      previous: ${{ steps.ver.outputs.previous }}
+    steps:
+      - name: Checkout the merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Configure Git
+        run: |
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+
+      - name: Compute next version and changelog
+        id: ver
+        env:
+          BUMP: ${{ inputs.version_bump || github.event.inputs.version_bump || 'patch' }}
+          PREFIX: v
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          latest="$(git tag --list "${PREFIX}[0-9]*" --sort=-v:refname | head -n1 || true)"
+
+          if [[ -z "$latest" ]]; then
+            next="1.0.0"
+          else
+            ver="${latest#"${PREFIX}"}"
+            if [[ ! "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "::error::Latest tag '$latest' is not semver"; exit 1
+            fi
+            major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
+            case "$BUMP" in
+              major) major=$((major+1)); minor=0; patch=0 ;;
+              minor) minor=$((minor+1)); patch=0 ;;
+              patch) patch=$((patch+1)) ;;
+              *) echo "::error::Invalid bump '$BUMP'"; exit 1 ;;
+            esac
+            next="${major}.${minor}.${patch}"
+          fi
+          tag="${PREFIX}${next}"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag $tag already exists"; exit 1
+          fi
+
+          # Changelog: everything since the previous release tag (or the last 20 commits
+          # when there is none), merges excluded so the PR merge commit itself is not listed.
+          if [[ -z "$latest" ]]; then
+            changelog="$(git log -n 20 --pretty=format:'- %s (%h)' --no-merges)"
+          else
+            changelog="$(git log "${latest}..HEAD" --pretty=format:'- %s (%h)' --no-merges)"
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=$next"
+            echo "previous=${latest:-none}"
+            echo "changelog<<CHANGELOG_EOF"
+            echo "$changelog"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Next version $tag (previous: ${latest:-none}, bump: $BUMP)"
+
+      - name: Create and push annotated tag
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          SHA: ${{ needs.guard.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git tag -a "$TAG" -m "Release $TAG" "$SHA"
+          git push origin "refs/tags/$TAG"
+          echo "::notice::Tagged $SHA as $TAG"
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.ver.outputs.tag }}
+          commit: ${{ needs.guard.outputs.sha }}
+          name: Release ${{ steps.ver.outputs.tag }}
+          body: |
+            ## Release ${{ steps.ver.outputs.tag }}
+
+            ${{ inputs.release_notes || github.event.inputs.release_notes || format('Released from `{0}`.', needs.guard.outputs.ref) }}
+
+            ### Changes since ${{ steps.ver.outputs.previous }}
+            ${{ steps.ver.outputs.changelog }}
+
+            ---
+            **Merged by**: @${{ github.actor }}
+            **Source PR**: ${{ github.event.pull_request.html_url || 'n/a (manual dispatch)' }}
+            **Workflow**: [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          draft: false
+          prerelease: false
+          generateReleaseNotes: false
+
+      - name: Summary
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          PREV: ${{ steps.ver.outputs.previous }}
+          REF: ${{ needs.guard.outputs.ref }}
+          CHANGELOG: ${{ steps.ver.outputs.changelog }}
+        run: |
+          {
+            echo "### Release $TAG"
+            echo ""
+            echo "- **Branch**: \`$REF\`"
+            echo "- **Previous**: \`$PREV\`"
+            echo "- **Release**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+            echo ""
+            echo "### Changelog"
+            echo "$CHANGELOG"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release_notes:
+    name: AI release notes (optional)
+    needs: [guard, release]
+    if: always() && needs.guard.outputs.proceed == 'true' && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: Draft with the org-release-notes agent prompt (skipped without an API key)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MODEL: ${{ vars.ORG_RELEASE_NOTES_MODEL }}
+          # Optional: point at an Anthropic-compatible proxy (e.g. a self-hosted
+          # CLIProxyAPI). Unset → the public api.anthropic.com.
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+          TAG: ${{ needs.release.outputs.tag }}
+          PREV: ${{ needs.release.outputs.previous }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANTHROPIC_API_KEY:-}" || -z "${MODEL:-}" ]]; then
+            echo "::notice::AI release notes skipped (ANTHROPIC_API_KEY secret and ORG_RELEASE_NOTES_MODEL variable are both required)"; exit 0
+          fi
+          range="HEAD~20..HEAD"; [[ "$PREV" != "none" ]] && range="${PREV}..HEAD"
+          {
+            echo "RANGE: $range"; echo; echo "COMMITS:"; git log --format='%h %an: %s%n%(trailers:key=Claude-Session,valueonly)' "$range"
+            echo; echo "DIFFSTAT:"; git diff --stat "$range" | tail -60
+            echo; echo "ADRS:"; git diff --name-only "$range" -- docs/adr | sed 's/^/  /'
+            echo; echo "PR BODY:"; gh pr list --repo "$GITHUB_REPOSITORY" --state merged --search "$GITHUB_SHA" --json body -q '.[0].body' 2>/dev/null || true
+          } > context.txt
+          # system prompt = the agent's body (below its frontmatter); the model comes from a variable, never from this file
+          SYSTEM="$(awk 'f{print} /^---$/{c++; if(c==2)f=1}' .org/claude/agents/org-release-notes.md)"; export SYSTEM
+          python3 - <<'EOF' > notes.md
+          import json, os, urllib.request
+          body = {"model": os.environ["MODEL"], "max_tokens": 2000,
+                  "system": os.environ["SYSTEM"],
+                  "messages": [{"role": "user", "content": "Draft the release note for tag " + os.environ["TAG"] + " from this context:\n\n" + open("context.txt").read()}]}
+          base = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
+          req = urllib.request.Request(base + "/v1/messages", data=json.dumps(body).encode(),
+                headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01", "content-type": "application/json"})
+          with urllib.request.urlopen(req, timeout=120) as r:
+              resp = json.load(r)
+          print("".join(b.get("text", "") for b in resp.get("content", [])))
+          u = resp.get("usage", {}); open("usage.json", "w").write(json.dumps(u))
+          EOF
+          echo "::group::draft"; cat notes.md; echo "::endgroup::"
+          current="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body)"
+          printf '%s\n\n---\n\n## Release notes (drafted by the org-release-notes agent, review before relying on it)\n\n%s\n' "$current" "$(cat notes.md)" > newbody.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file newbody.md
+      - name: Export usage as a metric
+        if: always()
+        uses: ./.org/.github/actions/org-metrics
+        with:
+          event: ai-tokens
+          result: ${{ job.status }}
+          extra: '{"step":"release-notes"}'
+
+  back_merge:
+    name: Back-merge into the integration branch
+    needs: [guard, release]
+    if: always() && needs.guard.outputs.proceed == 'true' && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: Open the back-merge PR (deploy branch → integration branch) if they differ
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_REF: ${{ needs.guard.outputs.ref }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          integ="$(python3 .org/claude/orgfile.py . branches.integration)"
+          if ! git ls-remote --exit-code --heads origin "$integ" >/dev/null 2>&1; then
+            echo "::notice::no '$integ' branch; nothing to back-merge"; exit 0
+          fi
+          git fetch origin "$integ" "$DEPLOY_REF"
+          if git merge-base --is-ancestor "origin/$DEPLOY_REF" "origin/$integ"; then
+            echo "::notice::'$integ' already contains $DEPLOY_REF; nothing to back-merge"; exit 0
+          fi
+          if gh pr list --repo "$GITHUB_REPOSITORY" --base "$integ" --head "$DEPLOY_REF" --state open --json number -q '.[0].number' | grep -q .; then
+            echo "::notice::back-merge PR already open"; exit 0
+          fi
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "$integ" --head "$DEPLOY_REF" \
+            --title "Back-merge ${TAG} into ${integ}" \
+            --body "Keeps \`${integ}\` in sync with \`${DEPLOY_REF}\` after release ${TAG} (hotfixes and rollbacks land on the deploy branch first). Carries nothing new; merge when green." \
+            || echo "::warning::could not open the back-merge PR"

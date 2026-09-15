@@ -1,0 +1,3 @@
+# jeirslab fleet allowlist. One "owner/repo" per line; "#" comments.
+# Supersede target: claude/repos.toml (ADR-012).
+jeirslab/.github        # the org engine itself (dogfood)

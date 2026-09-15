@@ -1,0 +1,77 @@
+name: Claude Config CI
+
+# INFRA-272 — every change to the org agent baseline runs the sync script's tests, so a
+# broken template or merge rule cannot reach the sync workflow (ideas.md 13, first step).
+
+on:
+  pull_request:
+    paths: ['claude/**', 'flake.nix', 'flake.lock', 'org.toml', 'nix/**']
+  push:
+    branches: [main, feature-test]
+    paths: ['claude/**', 'flake.nix', 'flake.lock', 'org.toml', 'nix/**', '.github/workflows/**']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Kill switch (INFRA-273) + feature-test mode (ADR-009): automatic triggers are inert until
+    # ORG_WORKFLOWS_ENABLED is 'true'; with ORG_FEAT_TEST 'true' only the feature-test branch runs
+    # (and org-wide actions are confined to this repo there). Manual dispatch always works.
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate baseline files
+        run: |
+          set -euo pipefail
+          python3 -c 'import json; json.load(open("claude/settings.json")); json.load(open("claude/mcp.json"))'
+          grep -q '<!-- BEGIN ORG BASELINE -->' claude/CLAUDE.md
+          grep -q '<!-- END ORG BASELINE -->' claude/CLAUDE.md
+          grep -q '{{ORG_BASELINE_VERSION}}' claude/CLAUDE.md
+          grep -rq '{{ORG_GITHUB}}' claude/skills/   # the org reference lives in skills, not the lean block
+          for f in claude/skills/*/SKILL.md claude/agents/*.md; do head -1 "$f" | grep -q '^---$' || { echo "::error::$f lacks frontmatter"; exit 1; }; done
+          # The mechanism must stay company-agnostic: the org name (taken from context, so
+          # this check follows a rename) must not appear in any mechanism file. The baseline
+          # CLAUDE.md is content, not mechanism: it uses {{ORG_GITHUB}} for the org and may name
+          # data such as Jira project keys.
+          if grep -rniF -- "${{ github.repository_owner }}" claude/sync.py claude/org-check.sh claude/jira/ claude/targets.py claude/runner_pick.py claude/runner_bootstrap.py flake.nix nix/github/options.nix nix/github/emit.nix nix/runner/module.nix nix/runner/host.nix .github/workflows/ .github/scripts/; then
+            echo "::error::organization name found in a mechanism file; use github.repository_owner / {{ORG_GITHUB}} / --org instead"; exit 1
+          fi
+          ! grep -nE '(AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xprv[0-9A-Za-z]{20,})' -r claude/ || { echo "::error::credential-shaped string under claude/"; exit 1; }
+      - name: Unit tests
+        run: python3 -m unittest discover -s claude/tests -v
+      - name: This repo's own declaration and hooks
+        run: |
+          python3 claude/orgfile.py . --validate
+          python3 claude/hooks/check_actions_pinned.py --root .
+          python3 claude/hooks/check_secrets.py --root .
+          python3 -c 'import json,glob; [json.load(open(f)) for f in glob.glob("claude/rulesets/*.json")]'
+          python3 claude/jira/jira_cli.py --root . config >/dev/null && python3 claude/jira/jira_cli.py sweep --help >/dev/null
+      - name: Dry-run against an empty repo and against this repo
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          python3 claude/sync.py apply --source claude --target "$tmp" --version ci --org "${{ github.repository_owner }}"
+          python3 claude/sync.py check --source claude --target "$tmp"
+
+  nix:
+    name: nix flake check (ADR-005)
+    # Kill switch (INFRA-273) + feature-test mode (ADR-009): automatic triggers are inert until
+    # ORG_WORKFLOWS_ENABLED is 'true'; with ORG_FEAT_TEST 'true' only the feature-test branch runs
+    # (and org-wide actions are confined to this repo there). Manual dispatch always works.
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - name: flake check
+        run: nix flake check --print-build-logs
+      - name: org-check runs
+        run: nix run .#org-check -- . || true   # this repo's own gaps are reported, not fatal here
+      - name: sync-agent-config runs
+        run: nix run .#sync-agent-config -- --help >/dev/null
+      - name: platform.github stack renders (ADR-010)
+        run: |
+          nix build .#platform-github --print-build-logs
+          python3 -c 'import json; d=json.load(open("result")); print({k: len(v) for k, v in d["resource"].items()})'

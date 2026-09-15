@@ -1,0 +1,81 @@
+name: Org ADR Consolidation
+# @doc: Reusable for the org docs repository (ideas.md 1). Gathers every repository's `docs/adr/` from `claude/repos.txt` of the org `.github` repo (or a given list) into `<out_dir>/<repo>/`, generates one index with status/date/ticket, and opens a PR in the calling repository. Also dispatchable here for a dry run.
+
+on:
+  workflow_call:
+    inputs:
+      out_dir:
+        type: string
+        default: adr
+        required: false
+      repos:
+        description: 'Space-separated owner/repo list (default: the org allowlist)'
+        type: string
+        default: ''
+        required: false
+      ref_map:
+        description: 'Space-separated repo=branch overrides, e.g. "deployments=nightly"'
+        type: string
+        default: ''
+        required: false
+    secrets:
+      ORG_SYNC_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      repos:
+        type: string
+        default: ''
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  runner:
+    uses: ./.github/workflows/_runner.yml
+    secrets: inherit
+
+  consolidate:
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_SYNC_TOKEN }}
+          path: .org
+      - name: Gather and index
+        env:
+          TOKEN: ${{ secrets.ORG_SYNC_TOKEN }}
+          REPOS: ${{ inputs.repos }}
+          REF_MAP: ${{ inputs.ref_map }}
+          OUT: ${{ inputs.out_dir || 'adr' }}
+          ORG_FEAT_TEST: ${{ vars.ORG_FEAT_TEST }}
+          ORG_FEAT_TEST_BRANCH: ${{ vars.ORG_FEAT_TEST_BRANCH }}
+        run: |
+          set -euo pipefail
+          t="$(python3 .org/claude/targets.py --owner "$GITHUB_REPOSITORY_OWNER" --repos-file .org/claude/repos.txt --repos "$REPOS")"
+          mapfile -t targets < <(echo "$t" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["repos"]))')
+          ref="$(echo "$t" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ref"])')"
+          args=(--out "$OUT" --token "$TOKEN" --repos "${targets[@]}")
+          if [[ -n "$ref" ]]; then for r in "${targets[@]}"; do args+=(--ref-map "${r#*/}=$ref"); done
+          elif [[ -n "${REF_MAP// }" ]]; then read -ra _rm <<< "$REF_MAP"; args+=(--ref-map "${_rm[@]}"); fi
+          python3 .org/claude/adr_consolidate.py "${args[@]}" | tee consolidate.log
+          rm -rf .org
+          { echo "### ADR consolidation"; echo; echo '```'; cat consolidate.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: peter-evans/create-pull-request@v6
+        if: github.event_name != 'workflow_dispatch' || github.repository != format('{0}/.github', github.repository_owner)
+        with:
+          token: ${{ secrets.ORG_SYNC_TOKEN }}
+          branch: chore/org-adr-consolidation
+          delete-branch: true
+          commit-message: "${{ vars.ORG_CHORE_TICKET || 'CHORE-000' }}: consolidate ADRs from all repositories"
+          author: org-config-sync <org-config-sync@users.noreply.github.com>
+          committer: org-config-sync <org-config-sync@users.noreply.github.com>
+          title: "${{ vars.ORG_CHORE_TICKET || 'CHORE-000' }}: ADR consolidation"
+          labels: automated
+          body: |
+            All repositories' `docs/adr/` gathered into `${{ inputs.out_dir || 'adr' }}/<repo>/` with a single index (ideas.md 1). The write side stays in each repository; this is a projection.

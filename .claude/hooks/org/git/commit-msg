@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Org git hook (ADR-007): every commit subject carries a ticket prefix `<PROJECT>-NNN: `.
+# Merge/revert/rollback/back-merge subjects are exempt, matching the CI check.
+set -uo pipefail
+[[ -n "${ORG_HOOKS_SKIP:-}" ]] && exit 0
+subject="$(sed -n '1{/^#/!p}' "$1" | head -n1)"
+[[ -z "$subject" ]] && exit 0
+case "$subject" in
+  "Merge "*|"Back-merge "*|"Rollback "*|"Revert \""*|"fixup! "*|"squash! "*) exit 0 ;;
+esac
+if [[ ! "$subject" =~ ^([A-Z][A-Z0-9]{1,9}-[0-9]+):\ [^[:space:]] ]]; then
+  echo "commit-msg: subject must start with a ticket key, e.g. 'INFRA-123: what changed'"
+  echo "            got: $subject"
+  echo "            (skill org-jira explains how to find or create the ticket)"
+  exit 1
+fi
+key="${BASH_REMATCH[1]}"
+
+# Ticket-status nudge (warn, never block): the org `jira` CLI keeps a local snapshot; when it
+# is there and the key is not In Progress, say so. ORG_JIRA_SNAPSHOT overrides the location.
+snap="${ORG_JIRA_SNAPSHOT:-}"
+if [[ -z "$snap" ]]; then
+  for f in "${XDG_CACHE_HOME:-$HOME/.cache}"/org-jira/*/summary.json; do [[ -f "$f" ]] && { snap="$f"; break; }; done
+fi
+if [[ -n "$snap" && -f "$snap" ]]; then
+  status="$(python3 - "$snap" "$key" <<'PY' 2>/dev/null || true
+import json, sys
+def walk(n):
+    yield n
+    for c in n.get("children", []) or []:
+        yield from walk(c)
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for p in d.get("projects", []):
+    for r in (p.get("epics") or []) + (p.get("issues") or []):
+        for n in walk(r):
+            if n.get("key") == sys.argv[2]:
+                print(n.get("status") or ""); sys.exit(0)
+print("?")
+PY
+)"
+  case "$status" in
+    ""|"In Progress") ;;
+    "?") echo "commit-msg: note: $key is not in the local Jira snapshot ($snap); run 'jira sync' if it should be" ;;
+    *)   echo "commit-msg: warning: $key is '$status' in the local snapshot, not In Progress — transition it (skill org-jira) or run 'jira sync'" ;;
+  esac
+fi
+exit 0

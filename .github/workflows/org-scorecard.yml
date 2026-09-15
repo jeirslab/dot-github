@@ -1,0 +1,114 @@
+name: Org Scorecard
+# @doc: Weekly conformance scorecard (ideas.md 10). Runs `org-check` and the agent-config sync check against every repository in `claude/repos.txt`, writes one row per repository to `SCORECARD.md`, and opens/updates a PR in this repository with the result. Needs `ORG_SYNC_TOKEN` (read on the targets, write here).
+
+on:
+  schedule:
+    - cron: '41 6 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: org-scorecard
+  cancel-in-progress: false
+
+jobs:
+  runner:
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    uses: ./.github/workflows/_runner.yml
+    secrets: inherit
+
+  plan:
+    needs: runner
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    runs-on: ${{ needs.runner.outputs.label }}
+    outputs:
+      repos: ${{ steps.l.outputs.repos }}
+      ref: ${{ steps.l.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: l
+        env:
+          ORG_FEAT_TEST: ${{ vars.ORG_FEAT_TEST }}
+          ORG_FEAT_TEST_BRANCH: ${{ vars.ORG_FEAT_TEST_BRANCH }}
+        run: python3 claude/targets.py --owner "$GITHUB_REPOSITORY_OWNER" --repos-file claude/repos.txt --github-output
+
+  check:
+    needs: [runner, plan]
+    if: needs.plan.outputs.repos != '[]'
+    runs-on: ${{ needs.runner.outputs.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(needs.plan.outputs.repos) }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: source }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ needs.plan.outputs.ref }}
+          token: ${{ secrets.ORG_SYNC_TOKEN || github.token }}
+          path: target
+          fetch-depth: 0
+      - name: org-check + sync check
+        run: |
+          set +e
+          slug="$(echo '${{ matrix.repo }}' | tr '/' '_')"
+          bash source/claude/org-check.sh target > "check-$slug.txt" 2>&1; rc1=$?
+          python3 source/claude/sync.py check --source source/claude --target target --org "${{ github.repository_owner }}" > "sync-$slug.txt" 2>&1; rc2=$?
+          python3 source/claude/orgfile.py target --validate > "org-$slug.txt" 2>&1; rc3=$?
+          miss=$(grep -c 'MISS' "check-$slug.txt")
+          printf '%s\t%s\t%s\t%s\t%s\n' '${{ matrix.repo }}' "$rc1" "$miss" "$rc2" "$rc3" > "row-$slug.tsv"
+          cat "check-$slug.txt"; cat "sync-$slug.txt"; cat "org-$slug.txt"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-${{ strategy.job-index }}
+          path: |
+            row-*.tsv
+            check-*.txt
+
+  publish:
+    needs: [runner, check]
+    runs-on: ${{ needs.runner.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: scorecard-*, merge-multiple: true, path: rows }
+      - name: Render SCORECARD.md
+        run: |
+          python3 - <<'EOF'
+          import glob, datetime
+          rows = []
+          for f in sorted(glob.glob("rows/row-*.tsv")):
+              repo, rc1, miss, rc2, rc3 = open(f).read().strip().split("\t")
+              slug = repo.replace("/", "_")
+              gaps = [l.strip() for l in open(f"rows/check-{slug}.txt") if "MISS" in l]
+              rows.append((repo, rc1 == "0", int(miss), rc2 == "0", rc3 == "0", gaps))
+          out = ["# Org conformance scorecard", "", f"Generated {datetime.date.today().isoformat()} by `org-scorecard.yml`; do not edit by hand.", "",
+                 "| Repository | Conformant | Gaps | Agent config in sync | org.toml valid |", "|---|---|---|---|---|"]
+
+          for repo, ok, miss, sync_ok, org_ok, gaps in rows:
+              out.append(f"| `{repo}` | {'✅' if ok else '❌'} | {miss} | {'✅' if sync_ok else '❌'} | {'✅' if org_ok else '❌'} |")
+          out += ["", "## Gaps", ""]
+          for repo, ok, miss, sync_ok, org_ok, gaps in rows:
+              if gaps:
+                  out.append(f"### `{repo}`"); out += [f"- {g.replace('MISS','').strip()}" for g in gaps]; out.append("")
+          open("SCORECARD.md", "w").write("\n".join(out) + "\n")
+          EOF
+          cat SCORECARD.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.ORG_SYNC_TOKEN || github.token }}
+          branch: chore/org-scorecard
+          delete-branch: true
+          commit-message: "${{ vars.ORG_CHORE_TICKET || 'CHORE-000' }}: weekly org conformance scorecard"
+          author: org-config-sync <org-config-sync@users.noreply.github.com>
+          committer: org-config-sync <org-config-sync@users.noreply.github.com>
+          title: "${{ vars.ORG_CHORE_TICKET || 'CHORE-000' }}: org conformance scorecard"
+          labels: automated,org-scorecard
+          body: |
+            Weekly conformance scorecard across `claude/repos.txt` (ideas.md 10). Merge to record; run `org-bootstrap.yml` on a repository to close its gaps.

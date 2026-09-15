@@ -1,0 +1,7 @@
+{
+  "name": "Org pipeline (gate, guardrails, staging deploy)",
+  "description": "Runs the org verification gate and guardrails on pull requests, and gate + artifact + staging deploy on pushes to staging. Reads org.toml. Pair with the Org release template.",
+  "iconName": "check-circle",
+  "categories": ["Continuous integration", "Deployment"],
+  "filePatterns": ["org.toml$", "flake.nix$"]
+}

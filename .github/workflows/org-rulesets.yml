@@ -1,0 +1,62 @@
+name: Org Rulesets
+# @doc: Branch protection as code (ADR-003, R5/R9). Applies `claude/rulesets/*.json` to every repository in `claude/repos.txt` (or a dispatched subset): deploy branches PR-only with required checks `gate / gate` and `guardrails / *`, code-owner review, no force-push or deletion; the integration branch protected against rewrites only. Diffs before writing; weekly drift correction. Needs `ORG_ADMIN_TOKEN`.
+
+on:
+  push:
+    branches: [main, feature-test]
+    paths: ['claude/rulesets/**', 'claude/repos.txt', 'claude/apply_rulesets.py']
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: 'Space-separated owner/repo subset (default: claude/repos.txt)'
+        type: string
+        default: ''
+        required: false
+      dry_run:
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: org-rulesets
+  cancel-in-progress: false
+
+jobs:
+  runner:
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    uses: ./.github/workflows/_runner.yml
+    secrets: inherit
+
+  apply:
+    needs: runner
+    # Kill switch (INFRA-273) + feature-test mode (ADR-009): automatic triggers are inert until
+    # ORG_WORKFLOWS_ENABLED is 'true'; with ORG_FEAT_TEST 'true' only the feature-test branch runs
+    # (and org-wide actions are confined to this repo there). Manual dispatch always works.
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    runs-on: ${{ needs.runner.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require ORG_ADMIN_TOKEN
+        env: { TOKEN: "${{ secrets.ORG_ADMIN_TOKEN }}" }
+        run: |
+          if [[ -z "$TOKEN" ]]; then echo "::error::ORG_ADMIN_TOKEN is not set (needs 'administration: write' on the target repositories)"; exit 1; fi
+      - name: Apply rulesets
+        env:
+          ORG_ADMIN_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+          REPOS: ${{ inputs.repos }}
+          DRY: ${{ inputs.dry_run }}
+          ORG_FEAT_TEST: ${{ vars.ORG_FEAT_TEST }}
+          ORG_FEAT_TEST_BRANCH: ${{ vars.ORG_FEAT_TEST_BRANCH }}
+        run: |
+          set -euo pipefail
+          # targets.py: the allowlist, an override, or (feature-test mode) only this repository
+          mapfile -t targets < <(python3 claude/targets.py --owner "$GITHUB_REPOSITORY_OWNER" --repos-file claude/repos.txt --repos "$REPOS" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["repos"]))')
+          args=(--repos "${targets[@]}")
+          [[ "$DRY" == "true" ]] && args+=(--dry-run)
+          python3 claude/apply_rulesets.py "${args[@]}" | tee rulesets.log
+          { echo "### Rulesets"; echo; echo '```'; cat rulesets.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

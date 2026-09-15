@@ -1,0 +1,64 @@
+# org.toml — what the org workflows run for this repository (ADR-003).
+# Every key is optional; defaults are in claude/orgfile.py of the org .github repo.
+
+[branches]
+integration = "staging"          # direct pushes allowed; fast gate runs here
+deploy = ["main", "master"]      # PR-only; full gate + approval; a merge is a release
+
+[gate]
+fast = "nix flake check"         # push / PR into the integration branch
+full = "nix flake check"         # PR into a deploy branch (defaults to fast)
+uses_nix = true
+timeout_minutes = 30
+
+# [deploy.staging]               # runs after a push/merge to the integration branch
+# command = "just deploy staging"
+# runner = ["self-hosted", "tailnet"]
+# environment = "staging"        # GitHub Environment: secrets + optional approvers
+# health = "https://staging.example.internal/healthz"   # URL (2xx) or a command
+# health_timeout_minutes = 10
+
+# [deploy.production]            # runs after a PR merges into a deploy branch
+# command = "just deploy production"
+# runner = ["self-hosted", "tailnet"]
+# environment = "production"     # required reviewers here = the named approver set (R9)
+# health = "https://app.example/healthz"
+# health_timeout_minutes = 15
+
+# [artifacts.oci]
+# attr = "packages.x86_64-linux.oci-image"   # nix attribute producing an OCI tarball
+# registry = "ghcr.io"
+
+[adr]
+required_paths = [".github/workflows/**", "migrations/**", "contracts/**"]
+
+[secrets]
+sops_paths = ["nix/secrets/**", "**/*.sops.*"]
+allow_paths = []                 # documented test vectors etc.
+
+[generated]
+files = [{ path = "flake.lock", inputs = ["flake.nix"] }]
+
+[pr]
+max_files = 60
+max_lines = 2000
+require_verification_section = true
+
+[workflows]                      # which org workflows this repo runs (ADR-004); the org sync
+# generates .github/workflows/org-<feature>.yml callers for each and prunes deselected ones.
+enabled = []  # a .github engine hosts the reusable workflows; consumer repos set their own
+
+[codeowners]                     # sensitive paths → required reviewers (R9)
+# "nix/hosts/pve/btc-*" = ["@ORG/bitcoin-ops"]
+# "nix/secrets/**" = ["@ORG/security"]
+
+[verify]
+ui = false                       # true → the Playwright MCP is synced into .mcp.json for the org-verifier subagent
+# command = "just verify-staging" # optional: what the verifier runs against a deployed environment
+
+[jira]                           # org Jira CLI (ADR-008); credentials only from JIRA_EMAIL / JIRA_API_TOKEN
+base_url = "https://ORG.atlassian.net"
+[jira.sync]
+projects = ["PROJ"]              # snapshot scope; also the keys recognised in branch names
+[jira.standup]
+projects = ["PROJ"]              # included wholesale; shared_projects = filtered to the caller

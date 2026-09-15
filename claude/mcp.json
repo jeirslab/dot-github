@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "nixos": {
+      "command": "nix",
+      "args": [
+        "run",
+        "nixpkgs#mcp-nixos",
+        "--"
+      ]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest",
+        "--headless"
+      ],
+      "x-org-when": "verify.ui"
+    }
+  }
+}

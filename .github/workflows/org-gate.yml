@@ -1,0 +1,117 @@
+name: Org Gate
+# @doc: Reusable verification gate (ADR-003, R1–R3). Reads the caller repository's `org.toml`, picks the tier (fast for the integration branch, full for a PR into a deploy branch), installs nix when declared, and runs the repository's own gate command. The check is named `gate` so rulesets can require it.
+# @doc: Call from a consuming repo's workflow on pull_request and on push to the integration branch. Pass `secrets: inherit`; set `ORG_READ_TOKEN` if the org `.github` repository is private.
+
+on:
+  workflow_call:
+    inputs:
+      tier:
+        description: 'fast | full | auto (auto: full when the PR targets a deploy branch)'
+        type: string
+        default: auto
+        required: false
+      timeout_minutes:
+        type: number
+        default: 30
+        required: false
+    secrets:
+      ORG_READ_TOKEN:
+        description: 'Token able to read the org .github repository (only needed if it is private)'
+        required: false
+    outputs:
+      tier:
+        value: ${{ jobs.gate.outputs.tier }}
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    outputs:
+      tier: ${{ steps.plan.outputs.tier }}
+    steps:
+      - name: Checkout repository under test
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout org baseline (scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+
+      - name: Read org.toml and pick the tier
+        id: plan
+        env:
+          TIER_IN: ${{ inputs.tier }}
+          BASE_REF: ${{ github.base_ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 .org/claude/orgfile.py . --validate
+          deploy_json="$(python3 .org/claude/orgfile.py . branches.deploy)"
+          uses_nix="$(python3 .org/claude/orgfile.py . gate.uses_nix)"
+          target="${BASE_REF:-$REF_NAME}"
+          is_deploy=false
+          if python3 - "$target" "$deploy_json" <<'EOF'
+          import json, sys
+          sys.exit(0 if sys.argv[1] in json.loads(sys.argv[2]) else 1)
+          EOF
+          then is_deploy=true; fi
+          tier="$TIER_IN"
+          if [[ "$tier" == "auto" ]]; then
+            if $is_deploy; then tier=full; else tier=fast; fi
+          fi
+          cmd="$(python3 .org/claude/orgfile.py . gate.$tier)"
+          if [[ -z "$cmd" ]]; then
+            if [[ "$tier" == "full" ]]; then
+              echo "::error::org.toml declares no gate.full / gate.fast — a deploy branch cannot be promoted without a verification gate (ADR-002 R1)"; exit 1
+            fi
+            echo "::warning::org.toml declares no gate.fast — nothing verified on this push"
+          fi
+          {
+            echo "tier=$tier"
+            echo "cmd=$cmd"
+            echo "uses_nix=$uses_nix"
+            echo "is_deploy=$is_deploy"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::gate tier=$tier target=$target cmd='${cmd:-<none>}'"
+
+      - name: Install nix
+        if: steps.plan.outputs.uses_nix == 'true' && steps.plan.outputs.cmd != ''
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Run the gate
+        if: steps.plan.outputs.cmd != ''
+        env:
+          GATE_CMD: ${{ steps.plan.outputs.cmd }}
+        run: |
+          set -eo pipefail
+          echo "+ $GATE_CMD"
+          bash -eo pipefail -c "$GATE_CMD"
+
+      - name: Summary
+        if: always()
+        env:
+          TIER: ${{ steps.plan.outputs.tier }}
+          CMD: ${{ steps.plan.outputs.cmd }}
+        run: |
+          {
+            echo "### Org gate — tier \`$TIER\`"
+            echo ""
+            echo "Command: \`${CMD:-<none declared>}\`  "
+            echo "Result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Metrics
+        if: always()
+        uses: ./.org/.github/actions/org-metrics
+        with:
+          event: gate
+          result: ${{ job.status }}
+          extra: '{"tier":"${{ steps.plan.outputs.tier }}"}'

@@ -1,0 +1,215 @@
+name: Org Deploy
+# @doc: Reusable deploy (ADR-003, R9/R10). Reads `deploy.<environment>` from the caller's `org.toml`; for a production-class environment first verifies the commit is an approved, gated, code-owner-reviewed merge (ADR-007), then runs the declared command on the declared runner labels inside the declared GitHub Environment (its required reviewers are the named approver set), then polls the declared health URL/command. A failed health check on a production-class environment opens a rollback PR to the previous release tag — proposed, never merged automatically.
+# @doc: Call with `environment: staging` on push to the integration branch and `environment: production` after a release. No `deploy.<environment>` in org.toml → the run is a no-op with a notice.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Key of org.toml [deploy.<environment>]'
+        type: string
+        required: true
+      ref:
+        description: 'Git ref to deploy (default: the calling SHA)'
+        type: string
+        default: ''
+        required: false
+      release_tag:
+        description: 'Tag being deployed, when known (used in rollback PR text)'
+        type: string
+        default: ''
+        required: false
+      required_checks:
+        description: 'Check-run names that must have succeeded on the PR head before a production deploy (ADR-007)'
+        type: string
+        default: 'gate / gate,guardrails / secrets,guardrails / commits,guardrails / pr,guardrails / supply-chain'
+        required: false
+    secrets:
+      ORG_READ_TOKEN:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  plan:
+    name: plan (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    outputs:
+      declared: ${{ steps.p.outputs.declared }}
+      command: ${{ steps.p.outputs.command }}
+      runner: ${{ steps.p.outputs.runner }}
+      gh_environment: ${{ steps.p.outputs.gh_environment }}
+      health: ${{ steps.p.outputs.health }}
+      health_timeout: ${{ steps.p.outputs.health_timeout }}
+      is_production_class: ${{ steps.p.outputs.is_production_class }}
+      deploy_branch: ${{ steps.p.outputs.deploy_branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - id: p
+        env:
+          ENV_KEY: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          python3 .org/claude/orgfile.py . --validate
+          cmd="$(python3 .org/claude/orgfile.py . "deploy.$ENV_KEY.command")"
+          if [[ -z "$cmd" ]]; then
+            echo "::notice::org.toml has no [deploy.$ENV_KEY]; nothing to deploy"
+            echo "declared=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          runner="$(python3 .org/claude/orgfile.py . "deploy.$ENV_KEY.runner")"; runner="${runner:-[\"ubuntu-latest\"]}"
+          ghenv="$(python3 .org/claude/orgfile.py . "deploy.$ENV_KEY.environment")"; ghenv="${ghenv:-$ENV_KEY}"
+          health="$(python3 .org/claude/orgfile.py . "deploy.$ENV_KEY.health")"
+          ht="$(python3 .org/claude/orgfile.py . "deploy.$ENV_KEY.health_timeout_minutes")"; ht="${ht:-10}"
+          deploy_json="$(python3 .org/claude/orgfile.py . branches.deploy)"
+          first_deploy="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])[0])' "$deploy_json")"
+          prod=false; [[ "$ENV_KEY" == "production" || "$ENV_KEY" == "prod" ]] && prod=true
+          {
+            echo "declared=true"; echo "command=$cmd"; echo "runner=$runner"; echo "gh_environment=$ghenv"
+            echo "health=$health"; echo "health_timeout=$ht"; echo "is_production_class=$prod"; echo "deploy_branch=$first_deploy"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::deploy $ENV_KEY on $runner in environment '$ghenv': $cmd"
+
+  verify:
+    name: verify approval (${{ inputs.environment }})
+    needs: plan
+    if: needs.plan.outputs.declared == 'true' && needs.plan.outputs.is_production_class == 'true' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: The commit must be an approved, gated, code-owner-reviewed merge (ADR-007)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUIRED: ${{ inputs.required_checks }}
+        run: |
+          python3 .org/claude/hooks/verify_pr.py --repo "$GITHUB_REPOSITORY" --sha "${{ inputs.ref || github.sha }}" --root . \
+            --required-checks "$REQUIRED" --min-approvals 1 --dump || {
+            echo "::error::refusing the production deploy: this commit did not land through an approved, gated pull request (or a touched code-owner path lacks an owner's approval)."; exit 1; }
+
+  deploy:
+    name: deploy (${{ inputs.environment }})
+    needs: [plan, verify]
+    if: always() && needs.plan.outputs.declared == 'true' && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
+    runs-on: ${{ fromJSON(needs.plan.outputs.runner) }}
+    environment: ${{ needs.plan.outputs.gh_environment }}
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+      - name: Run the declared deploy command
+        env:
+          DEPLOY_CMD: ${{ needs.plan.outputs.command }}
+          ORG_DEPLOY_ENV: ${{ inputs.environment }}
+          ORG_DEPLOY_REF: ${{ inputs.ref || github.sha }}
+          ORG_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -eo pipefail
+          echo "+ $DEPLOY_CMD"
+          bash -eo pipefail -c "$DEPLOY_CMD"
+
+  health:
+    name: health (${{ inputs.environment }})
+    needs: [plan, deploy]
+    if: needs.plan.outputs.declared == 'true' && needs.deploy.result == 'success' && needs.plan.outputs.health != ''
+    runs-on: ${{ fromJSON(needs.plan.outputs.runner) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Poll until healthy or timed out
+        env:
+          HEALTH: ${{ needs.plan.outputs.health }}
+          TIMEOUT_MIN: ${{ needs.plan.outputs.health_timeout }}
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
+          ok=false
+          while [[ $(date +%s) -lt $deadline ]]; do
+            if [[ "$HEALTH" =~ ^https?:// ]]; then
+              code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH" || echo 000)"
+              [[ "$code" =~ ^2 ]] && { ok=true; break; }
+              echo "health $HEALTH → $code; retrying"
+            else
+              if bash -c "$HEALTH"; then ok=true; break; fi
+              echo "health command failed; retrying"
+            fi
+            sleep 15
+          done
+          if $ok; then echo "::notice::healthy"; else echo "::error::not healthy after ${TIMEOUT_MIN} minutes"; exit 1; fi
+
+  rollback:
+    name: rollback proposal
+    needs: [plan, deploy, health]
+    if: always() && needs.plan.outputs.declared == 'true' && needs.plan.outputs.is_production_class == 'true' && (needs.deploy.result == 'failure' || needs.health.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Propose a rollback PR to the previous release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_BRANCH: ${{ needs.plan.outputs.deploy_branch }}
+          FAILED_TAG: ${{ inputs.release_tag }}
+          ENV_KEY: ${{ inputs.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git config user.name rollback-bot; git config user.email rollback-bot@users.noreply.github.com
+          git fetch --tags --force
+          tags="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname)"
+          # previous = newest tag that is not the failed one
+          prev=""
+          for t in $tags; do [[ "$t" != "$FAILED_TAG" ]] && { prev="$t"; break; }; done
+          if [[ -z "$prev" ]]; then echo "::error::no previous release tag to roll back to"; exit 1; fi
+          branch="rollback/${ENV_KEY}-to-${prev}-$(date +%Y%m%d-%H%M%S)"
+          git checkout -q -b "$branch" "origin/$DEPLOY_BRANCH"
+          git rm -rq . && git checkout -q "$prev" -- . && git add -A
+          git commit -q -m "Rollback ${DEPLOY_BRANCH} to ${prev}
+
+          Deploy/health of ${FAILED_TAG:-$GITHUB_SHA} to ${ENV_KEY} failed: ${RUN_URL}
+          This commit restores the tree of ${prev}. Proposed by the org deploy workflow; a human merges it."
+          git push -u origin "$branch"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "$DEPLOY_BRANCH" --head "$branch" \
+            --title "Rollback ${ENV_KEY} to ${prev}" \
+            --label "rollback" \
+            --body "## Rollback proposal
+
+          **Environment:** ${ENV_KEY}  **From:** ${FAILED_TAG:-$GITHUB_SHA}  **To:** ${prev}
+          **Trigger:** deploy or health check failed — [workflow run](${RUN_URL})
+
+          This PR restores the working tree of \`${prev}\` on \`${DEPLOY_BRANCH}\`. Merging it is a release (tagged, deployed) like any other merge into the deploy branch. It is a proposal: review the failure first; do not merge if the health check failed for a reason unrelated to this release.
+
+          Rolled-back commits:
+          \`\`\`
+          $(git log --oneline --no-merges "${prev}..origin/${DEPLOY_BRANCH}" | head -40)
+          \`\`\`" || echo "::warning::could not open the rollback PR (does the label 'rollback' exist? does the token have pull-requests: write?)"
+      - uses: actions/checkout@v4
+        if: always()
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - uses: ./.org/.github/actions/org-metrics
+        if: always()
+        with: { event: rollback-proposed, result: "${{ job.status }}", extra: '{"environment":"${{ inputs.environment }}"}' }

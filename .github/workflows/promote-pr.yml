@@ -1,0 +1,220 @@
+name: Branch Promotion PR (DEPRECATED)
+# @doc: **DEPRECATED (ADR-002, INFRA-262)** — v1 branch promotion (main→dev→qa→prod) that only checks for merge conflicts.
+# @doc: Kept working for existing `@v1` callers; emits a deprecation warning on every run. Do not adopt in new repositories.
+#
+# DEPRECATED: see docs/adr/adr-002-agent-aware-promotion-pipeline.md.
+# This workflow verifies nothing except a conflict-free merge and can auto-approve
+# PRs. It is replaced by an agent-aware promotion pipeline (v2, design in ADR-003).
+# It will be removed once every caller has migrated. Behaviour below is unchanged.
+
+on:
+  # Reusable workflow entrypoint (for uses: ...@v1)
+  workflow_call:
+    inputs:
+      source_branch:
+        description: 'Source branch to promote from'
+        type: string
+        required: true
+      target_branch:
+        description: 'Target branch to promote to'
+        type: string
+        required: true
+      auto_approve:
+        description: 'Auto-approve the PR (use for bot commits)'
+        type: boolean
+        default: false
+        required: false
+
+  # Manual trigger in this repo (optional, for local testing)
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Source branch to promote from'
+        type: choice
+        options:
+          - main
+          - dev
+          - qa
+          - prod
+        required: true
+      target_branch:
+        description: 'Target branch to promote to'
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+          - main
+        required: true
+      auto_approve:
+        description: 'Auto-approve the PR (use for bot commits)'
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  deprecation_notice:
+    name: Deprecation notice (ADR-002)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Warn that this workflow is deprecated
+        run: |
+          echo "::warning title=promote-pr.yml is deprecated::This v1 promotion workflow only checks for merge conflicts and is deprecated by ADR-002 (INFRA-262). It keeps working for existing @v1 callers but will be removed once the agent-aware v2 pipeline ships. See ${{ github.server_url }}/${{ github.repository }}/blob/main/docs/adr/adr-002-agent-aware-promotion-pipeline.md"
+          {
+            echo "### ⚠️ Deprecated workflow"
+            echo ""
+            echo "\`promote-pr.yml\` (v1) is deprecated by [ADR-002](${{ github.server_url }}/${{ github.repository }}/blob/main/docs/adr/adr-002-agent-aware-promotion-pipeline.md)."
+            echo "It verifies nothing beyond a conflict-free merge. Plan the migration to the v2 agent-aware promotion pipeline."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  validate:
+    name: Validate promotion path
+    needs: deprecation_notice
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check promotion path is valid
+        run: |
+          SOURCE="${{ inputs.source_branch || github.event.inputs.source_branch }}"
+          TARGET="${{ inputs.target_branch || github.event.inputs.target_branch }}"
+          
+          # Define valid promotion paths
+          declare -A VALID_PATHS=(
+            ["main:dev"]="Development environment"
+            ["dev:qa"]="QA/Staging environment"
+            ["qa:prod"]="Production environment"
+            ["prod:main"]="Post-release sync"
+          )
+          
+          REQUESTED="${SOURCE}:${TARGET}"
+          
+          if [[ -v VALID_PATHS[$REQUESTED] ]]; then
+            echo "✅ Valid promotion: $SOURCE → $TARGET"
+            echo "   Purpose: ${VALID_PATHS[$REQUESTED]}"
+          else
+            echo "::error::Invalid promotion path: $SOURCE → $TARGET"
+            echo ""
+            echo "Valid promotion paths:"
+            for path in "${!VALID_PATHS[@]}"; do
+              echo "  • ${path/:/ → } - ${VALID_PATHS[$path]}"
+            done
+            exit 1
+          fi
+
+  create_pr:
+    name: Create promotion PR
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.cpr.outputs.pull-request-number }}
+      pr_url: ${{ steps.cpr.outputs.pull-request-url }}
+      has_conflicts: ${{ steps.check_conflicts.outputs.has_conflicts }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check for conflicts
+        id: check_conflicts
+        run: |
+          set -euo pipefail
+          SOURCE="${{ inputs.source_branch || github.event.inputs.source_branch }}"
+          TARGET="${{ inputs.target_branch || github.event.inputs.target_branch }}"
+          
+          git fetch origin "$SOURCE" "$TARGET"
+          
+          # Attempt merge simulation
+          git checkout -b temp-merge-test "origin/$TARGET"
+          
+          if git merge --no-commit --no-ff "origin/$SOURCE" 2>&1; then
+            echo "has_conflicts=false" >> $GITHUB_OUTPUT
+            echo "✅ No merge conflicts detected"
+          else
+            echo "has_conflicts=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Merge conflicts detected"
+            
+            echo "::group::Conflicting Files"
+            git diff --name-only --diff-filter=U || true
+            echo "::endgroup::"
+          fi
+          
+          git merge --abort || true
+      
+      - name: Create promotion pull request
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: ${{ inputs.target_branch || github.event.inputs.target_branch }}
+          branch: promotion/${{ inputs.source_branch || github.event.inputs.source_branch }}-to-${{ inputs.target_branch || github.event.inputs.target_branch }}
+          title: "🚀 Promotion: ${{ inputs.source_branch || github.event.inputs.source_branch }} → ${{ inputs.target_branch || github.event.inputs.target_branch }}"
+          body: |
+            ## Promotion Details
+            
+            **Source**: `${{ inputs.source_branch || github.event.inputs.source_branch }}`  
+            **Target**: `${{ inputs.target_branch || github.event.inputs.target_branch }}`  
+            **Triggered by**: @${{ github.actor }}  
+            **Workflow**: [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            
+            ---
+            
+            ${{ steps.check_conflicts.outputs.has_conflicts == 'true'
+                && '⚠️ **MERGE CONFLICTS DETECTED** - Manual resolution required before merging'
+                || '✅ No conflicts detected - Safe to merge' }}
+            
+            ### Review Checklist
+            - [ ] Changes reviewed and approved
+            - [ ] Tests passing
+            - [ ] No breaking changes
+            - [ ] Ready for ${{ inputs.target_branch || github.event.inputs.target_branch }} environment
+          labels: ${{ steps.check_conflicts.outputs.has_conflicts == 'true'
+              && 'automated,promotion,conflicts'
+              || 'automated,promotion' }}
+          draft: false
+
+      - name: Add conflict warning comment
+        if: steps.check_conflicts.outputs.has_conflicts == 'true' &&
+            steps.cpr.outputs.pull-request-operation == 'created'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ steps.cpr.outputs.pull-request-number }}
+          body: |
+            ## ⚠️ Merge Conflicts Detected
+            
+            This PR has conflicts that must be resolved manually before merging.
+            
+            **To resolve conflicts**:
+            ```
+            git fetch origin
+            git checkout ${{ inputs.target_branch || github.event.inputs.target_branch }}
+            git merge origin/${{ inputs.source_branch || github.event.inputs.source_branch }}
+            # Resolve conflicts in your editor
+            git add .
+            git commit
+            git push origin ${{ inputs.target_branch || github.event.inputs.target_branch }}
+            ```
+            
+            See [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+      
+      - name: Auto-approve PR
+        if: |
+          (inputs.auto_approve == true || github.event.inputs.auto_approve == 'true') &&
+          steps.cpr.outputs.pull-request-operation == 'created' &&
+          steps.check_conflicts.outputs.has_conflicts == 'false'
+        uses: hmarr/auto-approve-action@v4
+        with:
+          pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
+      
+      - name: Summary
+        run: |
+          echo "### Promotion PR Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **PR**: [#${{ steps.cpr.outputs.pull-request-number }}](${{ steps.cpr.outputs.pull-request-url }})" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source**: \`${{ inputs.source_branch || github.event.inputs.source_branch }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target**: \`${{ inputs.target_branch || github.event.inputs.target_branch }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Conflicts**: ${{ steps.check_conflicts.outputs.has_conflicts == 'true' && '⚠️ Yes' || '✅ No' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Auto-approved**: ${{ inputs.auto_approve || github.event.inputs.auto_approve }}" >> $GITHUB_STEP_SUMMARY

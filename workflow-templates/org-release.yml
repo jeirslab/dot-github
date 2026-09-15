@@ -1,0 +1,50 @@
+name: Org release
+# Starter for consuming repositories (ADR-003). A PR merged into the deploy branch is a
+# release: tag + GitHub Release (+ back-merge PR into staging, + AI release notes when
+# configured), then the OCI artifact tagged with the release, then the production deploy
+# behind the `production` GitHub Environment (its required reviewers are the approver set).
+# Replace <org> with the GitHub organization (the bootstrap workflow does this for you).
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+  issues: write
+
+jobs:
+  branch-guard:
+    # ADR-007: on plans without rulesets, a direct push to a deploy branch is detected,
+    # reported and reverted by PR. The release below never runs for a direct push anyway.
+    if: github.event_name == 'push'
+    uses: <org>/.github/.github/workflows/org-branch-guard.yml@v2
+    secrets: inherit
+
+  release:
+    if: github.event_name == 'pull_request'
+    uses: <org>/.github/.github/workflows/sync-release.yml@v2
+    secrets: inherit
+
+  artifact:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    uses: <org>/.github/.github/workflows/org-oci.yml@v2
+    with:
+      tag: ${{ needs.release.outputs.tag }}
+      also_latest: true
+    secrets: inherit
+
+  deploy-production:
+    needs: [release, artifact]
+    if: needs.release.outputs.released == 'true'
+    uses: <org>/.github/.github/workflows/org-deploy.yml@v2
+    with:
+      environment: production
+      release_tag: ${{ needs.release.outputs.tag }}
+    secrets: inherit

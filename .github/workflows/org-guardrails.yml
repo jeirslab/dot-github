@@ -1,0 +1,167 @@
+name: Org Guardrails
+# @doc: Reusable deterministic guardrails for a pull request (ADR-003, R4/R8/R9): secrets scan (org patterns + gitleaks), commit ticket prefixes, provenance labels (`author:*`), PR hygiene (size, one ticket, Verification section, ADR-required paths, generated files), supply chain (pinned actions, new-dependency registry check).
+# @doc: Each job is a stable check name (`secrets`, `commits`, `provenance`, `pr`, `supply-chain`) so rulesets can require them. Same scripts run locally from `.claude/hooks/org/`.
+
+on:
+  workflow_call:
+    inputs:
+      min_dep_age_days:
+        type: number
+        default: 30
+        required: false
+    secrets:
+      ORG_READ_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  GITLEAKS_VERSION: 8.21.2
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      range: ${{ steps.r.outputs.range }}
+      is_pr: ${{ steps.r.outputs.is_pr }}
+    steps:
+      - id: r
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == "pull_request" || "$EVENT" == "pull_request_target" ]]; then
+            echo "range=${BASE_SHA}..${HEAD_SHA}" >> "$GITHUB_OUTPUT"; echo "is_pr=true" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$BEFORE" && "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            echo "range=${BEFORE}..${SHA}" >> "$GITHUB_OUTPUT"; echo "is_pr=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "range=${SHA}~1..${SHA}" >> "$GITHUB_OUTPUT"; echo "is_pr=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  secrets:
+    name: secrets
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: Org secret patterns, SOPS encryption, tracked .env
+        run: python3 .org/claude/hooks/check_secrets.py --root . --range "${{ needs.plan.outputs.range }}"
+      - name: gitleaks (pinned release)
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          ./gitleaks git --log-opts="${{ needs.plan.outputs.range }}" --redact --no-banner --exit-code 1 .
+      - uses: ./.org/.github/actions/org-metrics
+        if: always()
+        with: { event: guardrail-secrets, result: "${{ job.status }}" }
+
+  commits:
+    name: commits
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: Every commit carries a ticket prefix
+        run: python3 .org/claude/hooks/check_commits.py --root . --range "${{ needs.plan.outputs.range }}"
+
+  provenance:
+    name: provenance
+    needs: plan
+    if: needs.plan.outputs.is_pr == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: Classify authors and label the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          python3 .org/claude/hooks/provenance.py --root . --range "${{ needs.plan.outputs.range }}" --json > prov.json
+          cat prov.json
+          labels="$(python3 -c 'import json;print(",".join(json.load(open("prov.json"))["labels"]))')"
+          # ensure labels exist, then apply (existing author:* labels not in the set are removed)
+          for l in $(echo "$labels" | tr ',' ' '); do
+            gh label create "$l" --repo "$GITHUB_REPOSITORY" --color 5319e7 --description "provenance (org guardrails)" 2>/dev/null || true
+          done
+          current="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels -q '.labels[].name' | grep '^author:' | tr '\n' ',' | sed 's/,$//')"
+          [[ -n "$current" ]] && gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label "$current" || true
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label "$labels"
+          if python3 -c 'import json,sys; sys.exit(0 if json.load(open("prov.json"))["agent_authored"] else 1)'; then
+            echo "::notice::agent-authored PR — human approval into a deploy branch is mandatory (ADR-002 R5); auto-merge labels are for humans to apply"
+          fi
+
+  pr:
+    name: pr
+    needs: plan
+    if: needs.plan.outputs.is_pr == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: Hygiene, ADR-required paths, generated files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json body -q .body > body.md || true
+          labels="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels -q '.labels[].name' | tr '\n' ',')"
+          set +e
+          python3 .org/claude/hooks/check_pr.py --root . --range "${{ needs.plan.outputs.range }}" --body-file body.md --title "$TITLE" --labels "$labels" --json | tee pr.json
+          rc=${PIPESTATUS[0]}
+          set -e
+          suggest="$(python3 -c 'import json;print(",".join(json.load(open("pr.json"))["suggest_labels"]))' 2>/dev/null || true)"
+          for l in $(echo "$suggest" | tr ',' ' '); do
+            gh label create "$l" --repo "$GITHUB_REPOSITORY" --color d93f0b --description "org guardrails suggestion" 2>/dev/null || true
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label "$l" || true
+          done
+          exit "$rc"
+
+  supply-chain:
+    name: supply-chain
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: Actions pinned to a tag or SHA
+        run: python3 .org/claude/hooks/check_actions_pinned.py --root .
+      - name: New dependencies exist and are not brand new
+        run: python3 .org/claude/hooks/new_deps.py --root . --range "${{ needs.plan.outputs.range }}" --min-age-days "${{ inputs.min_dep_age_days }}"

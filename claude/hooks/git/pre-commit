@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Org git hook (ADR-007): secrets scan on the staged files before a commit is created.
+# Installed by the org dev shell via `git config core.hooksPath .claude/hooks/org/git`.
+# Bypass with --no-verify is possible but is logged by the server-side branch guard's
+# checks on the PR anyway. ORG_HOOKS_SKIP=1 disables all org hooks for one command.
+set -uo pipefail
+[[ -n "${ORG_HOOKS_SKIP:-}" ]] && exit 0
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(git rev-parse --show-toplevel)"
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR)
+[[ ${#staged[@]} -eq 0 ]] && exit 0
+# Scan the staged versions by pointing the checker at a temp export of them.
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+for f in "${staged[@]}"; do
+  mkdir -p "$tmp/$(dirname "$f")"
+  git show ":$f" > "$tmp/$f" 2>/dev/null || true
+done
+cp "$root/org.toml" "$tmp/org.toml" 2>/dev/null || true
+checker="$here/../check_secrets.py"   # next to the hooks, both distributed and in the source tree
+if ! python3 "$checker" --root "$tmp"; then
+  echo
+  echo "pre-commit: refusing to commit — a secret-shaped string or an unencrypted SOPS file is staged."
+  echo "Fix it (or mark a documented test vector with 'org-secrets: allow'); rotate anything real."
+  exit 1
+fi
+exit 0

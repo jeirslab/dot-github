@@ -1,0 +1,84 @@
+name: Emergency Rollback
+# @doc: Opens a rollback PR that restores the deploy branch to a previous release tag (v2 model, INFRA-276). Proposed, never merged automatically; merging it is a release like any other. Dispatch with the target tag, or leave it empty for the previous release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      to_tag:
+        description: 'Release tag to restore (default: the previous release)'
+        type: string
+        required: false
+        default: ''
+      reason:
+        description: 'Why (required, goes into the PR and the audit trail)'
+        type: string
+        required: true
+      incident_ticket:
+        description: 'Ticket key (e.g. INFRA-123)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rollback:
+    name: Propose rollback
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: Create the rollback PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TO_TAG: ${{ inputs.to_tag }}
+          REASON: ${{ inputs.reason }}
+          TICKET: ${{ inputs.incident_ticket }}
+        run: |
+          set -euo pipefail
+          git config user.name rollback-bot; git config user.email rollback-bot@users.noreply.github.com
+          deploy_json="$(python3 .org/claude/orgfile.py . branches.deploy)"
+          deploy="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])[0])' "$deploy_json")"
+          git fetch --tags --force; git fetch origin "$deploy"
+          current="$(git describe --tags --exact-match "origin/$deploy" 2>/dev/null || true)"
+          if [[ -z "$TO_TAG" ]]; then
+            for t in $(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname); do
+              [[ "$t" != "$current" ]] && { TO_TAG="$t"; break; }
+            done
+          fi
+          [[ -z "$TO_TAG" ]] && { echo "::error::no tag to roll back to"; exit 1; }
+          git rev-parse -q --verify "refs/tags/$TO_TAG" >/dev/null || { echo "::error::tag $TO_TAG not found"; exit 1; }
+          branch="rollback/${deploy}-to-${TO_TAG}-$(date +%Y%m%d-%H%M%S)"
+          git checkout -q -b "$branch" "origin/$deploy"
+          git rm -rq . && git checkout -q "$TO_TAG" -- . && git add -A
+          prefix=""; [[ -n "$TICKET" ]] && prefix="${TICKET}: "
+          git commit -q -m "${prefix}Rollback ${deploy} to ${TO_TAG}
+
+          Reason: ${REASON}
+          Requested by: ${GITHUB_ACTOR}
+          Restores the tree of ${TO_TAG}; proposed by the org rollback workflow."
+          git push -u origin "$branch"
+          gh label create rollback --repo "$GITHUB_REPOSITORY" --color b60205 --description "rollback proposal" 2>/dev/null || true
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "$deploy" --head "$branch" --label rollback \
+            --title "${prefix}Rollback ${deploy} to ${TO_TAG}" \
+            --body "## Rollback proposal
+
+          **Reason:** ${REASON}
+          **Requested by:** @${GITHUB_ACTOR}  **Ticket:** ${TICKET:-n/a}
+          **From:** ${current:-$(git rev-parse --short origin/$deploy)}  **To:** ${TO_TAG}
+
+          This PR restores the working tree of \`${TO_TAG}\` on \`${deploy}\`. Merging it is a release (tagged, deployed) like any other merge into the deploy branch.
+
+          Rolled-back commits:
+          \`\`\`
+          $(git log --oneline --no-merges "${TO_TAG}..origin/${deploy}" | head -40)
+          \`\`\`"

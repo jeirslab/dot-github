@@ -1,0 +1,13 @@
+name: Branch Guard
+# @org-managed: workflows — generated from org.toml [workflows].enabled by the org sync (ADR-004). Edit org.toml, not this file.
+on:
+  push:
+    branches: [main, master]
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+jobs:
+  guard:
+    uses: {{ORG_GITHUB}}/.github/.github/workflows/org-branch-guard.yml@v2
+    secrets: inherit

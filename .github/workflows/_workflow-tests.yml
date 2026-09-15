@@ -1,0 +1,107 @@
+name: Workflow Tests
+# Exercises the org's reusable workflows against this repository on the feature-test branch
+# (ADR-009, INFRA-283) before a change goes org-wide. Every org-* reusable workflow is either
+# called here or listed in claude/tests/test_workflows.py NOT_EXERCISED with a reason.
+#
+# Runs on push to the feature-test branch when ORG_FEAT_TEST is 'true', and on dispatch.
+
+on:
+  push:
+    branches: [feature-test]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  packages: write
+
+concurrency:
+  group: workflow-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: static policy tests
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Workflow policy (guards, docs, templates, exercised set)
+        run: python3 -m unittest claude.tests.test_workflows -v
+      - name: Targets resolve to this repo in feature-test mode
+        env:
+          ORG_FEAT_TEST: 'true'
+        run: |
+          python3 claude/targets.py --owner "$GITHUB_REPOSITORY_OWNER" --repos-file claude/repos.txt | tee t.json
+          python3 -c 'import json; t=json.load(open("t.json")); assert t["repos"]==["'"$GITHUB_REPOSITORY"'"], t'
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - name: actionlint
+        env:
+          # ADR-013: fail the gate on shellcheck warnings/errors, not info/style nits.
+          SHELLCHECK_OPTS: --severity=warning
+        run: nix run nixpkgs#actionlint -- -color .github/workflows/*.yml workflow-templates/*.yml
+
+  runner:
+    name: exercise the runner picker
+    needs: policy
+    uses: ./.github/workflows/_runner.yml
+    secrets: inherit
+
+  gate:
+    name: exercise org-gate
+    needs: policy
+    uses: ./.github/workflows/org-gate.yml
+    with:
+      tier: fast
+    secrets: inherit
+
+  guardrails:
+    name: exercise org-guardrails
+    needs: policy
+    uses: ./.github/workflows/org-guardrails.yml
+    secrets: inherit
+
+  deploy:
+    name: exercise org-deploy (test environment)
+    needs: [gate, guardrails]
+    uses: ./.github/workflows/org-deploy.yml
+    with:
+      environment: test
+    secrets: inherit
+
+  self-checks:
+    name: sync, scorecard and sweep against this repo
+    needs: policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: sync check against this checkout
+        run: python3 claude/sync.py check --source claude --target . --org "$GITHUB_REPOSITORY_OWNER"
+      - name: org-check
+        run: bash claude/org-check.sh . || true
+      - name: branch sweep (self, offline)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 claude/jira/jira_cli.py --root . sweep --repos "$GITHUB_REPOSITORY" --offline --out sweep.md && cat sweep.md >> "$GITHUB_STEP_SUMMARY"
+      - name: verify_pr against HEAD (expects rc 3 on a direct push, 0 on a PR merge)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          python3 claude/hooks/verify_pr.py --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --root . --min-approvals 0 --dump; rc=$?
+          echo "verify_pr rc=$rc (3 = direct push, 0 = merged PR, 1 = failed verification)"
+          [[ $rc -eq 0 || $rc -eq 3 ]]
+
+  summary:
+    name: result
+    needs: [policy, runner, gate, guardrails, deploy, self-checks]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | python3 -c 'import json,sys; n=json.load(sys.stdin); [print(f"{k}: {v[\"result\"]}") for k,v in n.items()]; sys.exit(0 if all(v["result"]=="success" for v in n.values()) else 1)' | tee -a "$GITHUB_STEP_SUMMARY"
