@@ -1,0 +1,225 @@
+name: Sync Org Agent Config
+# @doc: Distributes the org agent baseline (`claude/`) to every repository in `claude/repos.txt`: inserts or refreshes the managed BEGIN/END block at the top of the repo's CLAUDE.md, merges `.claude/settings.json` and `.mcp.json`, and opens (or updates) one PR per repo when anything changed.
+# @doc: Runs on push to `main` touching `claude/`, weekly as a drift check, and on dispatch (optionally dry-run or for a subset of repos). Needs the `ORG_SYNC_TOKEN` secret.
+#
+# INFRA-272 / ADR-004. The logic is claude/sync.py (stdlib Python, runs locally too);
+# this file only enumerates targets, checks them out, runs the script and opens PRs.
+
+on:
+  push:
+    branches: [main, feature-test]
+    paths: ['claude/**']
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC — drift check (idempotent: no change, no PR)
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: 'Space-separated owner/repo list to sync (default: claude/repos.txt)'
+        type: string
+        required: false
+        default: ''
+      dry_run:
+        description: 'Report what would change without opening PRs'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-agent-config
+  cancel-in-progress: false
+
+env:
+  # Standing tracker key for the bot's commits — every commit in the org carries one.
+  # Set repo/org variable ORG_CHORE_TICKET (e.g. INFRA-272); unset falls back to CHORE-000.
+  SYNC_TICKET: ${{ vars.ORG_CHORE_TICKET || 'CHORE-000' }}
+
+jobs:
+  runner:
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    uses: ./.github/workflows/_runner.yml
+    secrets: inherit
+
+  plan:
+    needs: runner
+    name: Test the sync script and list targets
+    # Kill switch (INFRA-273) + feature-test mode (ADR-009): automatic triggers are inert until
+    # ORG_WORKFLOWS_ENABLED is 'true'; with ORG_FEAT_TEST 'true' only the feature-test branch runs
+    # (and org-wide actions are confined to this repo there). Manual dispatch always works.
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    runs-on: ${{ needs.runner.outputs.label }}
+    outputs:
+      repos: ${{ steps.list.outputs.repos }}
+      ref: ${{ steps.list.outputs.ref }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Unit tests for claude/sync.py
+        run: python3 -m unittest discover -s claude/tests -v
+
+      - name: Version stamp for this baseline
+        id: ver
+        run: |
+          set -euo pipefail
+          # Tag when this commit is tagged, else <tag>-<n>-g<sha>, else the short SHA.
+          # Match semver tags only; the moving `v1`/`latest` aliases would otherwise win.
+          v="$(git describe --tags --always --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || git rev-parse --short HEAD)"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "::notice::Baseline version stamp: $v"
+
+      - name: Resolve target repositories (feature-test mode confines them to this repo, ADR-009)
+        id: list
+        env:
+          OVERRIDE: ${{ inputs.repos }}
+          ORG_FEAT_TEST: ${{ vars.ORG_FEAT_TEST }}
+          ORG_FEAT_TEST_BRANCH: ${{ vars.ORG_FEAT_TEST_BRANCH }}
+        run: |
+          set -euo pipefail
+          python3 claude/targets.py --owner "$GITHUB_REPOSITORY_OWNER" --repos-file claude/repos.txt --repos "$OVERRIDE" --github-output
+
+  sync:
+    name: ${{ matrix.repo }}
+    needs: [runner, plan]
+    if: needs.plan.outputs.repos != '[]'
+    runs-on: ${{ needs.runner.outputs.label }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        repo: ${{ fromJSON(needs.plan.outputs.repos) }}
+    steps:
+      - name: Mint a GitHub App token (ADR-015 — when the sync App is configured)
+        id: app-token
+        if: ${{ vars.ORG_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.ORG_APP_ID }}
+          private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Token mode (ADR-014/ADR-015 — App → PAT → GITHUB_TOKEN, graceful)
+        env:
+          APP: ${{ steps.app-token.outputs.token }}
+          PAT: ${{ secrets.ORG_SYNC_TOKEN }}
+        run: |
+          if [[ -n "$APP" ]]; then
+            echo "::notice::Using a GitHub App installation token (ORG_APP_ID) — fleet-wide, short-lived, no stored PAT."
+          elif [[ -n "$PAT" ]]; then
+            echo "::notice::Using ORG_SYNC_TOKEN — fleet-wide writes on every repo it can reach."
+          else
+            echo "::warning::No App and no ORG_SYNC_TOKEN — falling back to GITHUB_TOKEN, which reaches only ${{ github.repository }} and cannot push workflow files. Repos it cannot access are SKIPPED (a warning, not a failure). Set ORG_APP_ID/ORG_APP_PRIVATE_KEY (app-bootstrap) or a fine-grained PAT as ORG_SYNC_TOKEN for fleet-wide sync."
+          fi
+
+      - name: Checkout the baseline (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      - name: Checkout ${{ matrix.repo }}
+        id: checkout
+        continue-on-error: true    # a repo the current token can't reach is skipped, not fatal
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ needs.plan.outputs.ref }}
+          token: ${{ steps.app-token.outputs.token || secrets.ORG_SYNC_TOKEN || github.token }}
+          path: target
+          fetch-depth: 0
+
+      - name: Skip ${{ matrix.repo }} if unreachable with the current token
+        if: steps.checkout.outcome == 'failure'
+        run: |
+          echo "::warning::skipped ${{ matrix.repo }} — the current token cannot access it (needs write on this repo)."
+          echo "- \`${{ matrix.repo }}\` — **skipped** (no access with the current token)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pick the base branch (feature-test in test mode; else staging if present, else default)
+        id: base
+        if: steps.checkout.outcome == 'success'
+        working-directory: target
+        env:
+          PINNED_REF: ${{ needs.plan.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # Robust default-branch resolution: origin/HEAD is not always a symbolic ref (INFRA-305).
+          default="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)"
+          if [ -z "$default" ]; then for b in main master; do if git show-ref -q --verify "refs/remotes/origin/$b"; then default="$b"; break; fi; done; fi
+          if [ -z "$default" ]; then default="$(git branch -r --format='%(refname:short)' | sed -n 's@^origin/@@p' | grep -v '^HEAD$' | head -1 || true)"; fi
+          if [ -z "$default" ]; then default="main"; fi
+          if [[ -n "$PINNED_REF" ]]; then
+            base="$PINNED_REF"
+          elif git ls-remote --exit-code --heads origin staging >/dev/null 2>&1; then
+            base=staging
+          else
+            base="$default"
+          fi
+          git checkout -q "$base"
+          git reset -q --hard "origin/$base"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "::notice::${{ matrix.repo }}: base branch '$base' (default '$default')"
+
+      - name: Apply the baseline
+        id: apply
+        if: steps.checkout.outcome == 'success'
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 source/claude/sync.py apply \
+            --source source/claude --target target --version "$VERSION" \
+            --org "${{ github.repository_owner }}" --json | tee result.json
+          changed=$(python3 -c 'import json; print(str(json.load(open("result.json"))["changed"]).lower())')
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${{ matrix.repo }} (base: ${{ steps.base.outputs.base }})"
+            echo ""
+            echo '```'
+            python3 source/claude/sync.py summarize result.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Nothing to do
+        if: steps.checkout.outcome == 'success' && steps.apply.outputs.changed != 'true'
+        run: echo "::notice::${{ matrix.repo }} is in sync"
+
+      - name: Dry run — show diff only
+        if: steps.apply.outputs.changed == 'true' && inputs.dry_run == true
+        working-directory: target
+        run: |
+          git --no-pager status --short
+          git --no-pager diff
+          echo "::warning::Dry run: no PR opened for ${{ matrix.repo }}"
+
+      - name: Open or update the sync PR
+        if: steps.apply.outputs.changed == 'true' && inputs.dry_run != true
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: target
+          token: ${{ steps.app-token.outputs.token || secrets.ORG_SYNC_TOKEN || github.token }}
+          base: ${{ steps.base.outputs.base }}
+          branch: chore/org-agent-config
+          delete-branch: true
+          commit-message: |
+            ${{ env.SYNC_TICKET }}: sync org agent baseline ${{ needs.plan.outputs.version }}
+
+            Managed block in CLAUDE.md, .claude/settings.json and .mcp.json refreshed
+            from ${{ github.repository }} claude/ at ${{ needs.plan.outputs.version }}.
+          author: org-config-sync <org-config-sync@users.noreply.github.com>
+          committer: org-config-sync <org-config-sync@users.noreply.github.com>
+          title: "${{ env.SYNC_TICKET }}: org agent baseline ${{ needs.plan.outputs.version }}"
+          labels: automated,org-agent-config
+          body: |
+            ## Org agent baseline sync
+
+            Source: [`${{ github.repository }}` `claude/`](${{ github.server_url }}/${{ github.repository }}/tree/main/claude) at `${{ needs.plan.outputs.version }}` (ADR-001, ADR-004).
+
+            The block between `<!-- BEGIN ORG BASELINE -->` and `<!-- END ORG BASELINE -->` is owned upstream and replaced wholesale on every sync; everything outside it is this repository's and was not touched. `.claude/settings.json` and `.mcp.json` were merged (org entries added, repo entries preserved).
+
+            If this PR reverts an edit you made inside the block, that edit belongs upstream: open a PR against `${{ github.repository }}` `claude/` instead.
+
+            Triggered by: `${{ github.event_name }}` — [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})

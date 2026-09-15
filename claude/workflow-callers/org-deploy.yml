@@ -1,0 +1,14 @@
+name: Deploy
+# @org-managed: workflows — generated from org.toml [workflows].enabled by the org sync (ADR-004). Edit org.toml, not this file.
+# Reads deploy.<environment> from org.toml; a no-op for environments you have not declared.
+on:
+  push:
+    branches: [staging]
+permissions:
+  contents: read
+jobs:
+  deploy-staging:
+    uses: {{ORG_GITHUB}}/.github/.github/workflows/org-deploy.yml@v2
+    with:
+      environment: staging
+    secrets: inherit

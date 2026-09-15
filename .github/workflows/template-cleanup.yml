@@ -1,0 +1,44 @@
+name: Template Cleanup
+# @doc: Manual one-shot cleanup for a repository created from this template via the "Use this template" button. Dispatch it from the Actions tab in the generated repository (guarded so it does nothing in a template repository): it runs `.github/scripts/template-init.sh` to strip the template's own `docs/adr/` history, leave an empty ADR skeleton, and commit the result. Idempotent — a marker makes reruns no-ops. The sanctioned path for a tailored `.github` is `claude/construct.py`; this workflow only serves the raw-copy button path. Equivalent locally: `bash .github/scripts/template-init.sh`.
+#
+# Trigger is `workflow_dispatch`, NOT `create`: a create-triggered cleanup fires on every
+# branch creation and is destructive in any `is_template: false` repository (including this
+# engine during development). An automatic create-triggered variant is only safe in the
+# public template repository once it is marked `is_template: true`, and is introduced there.
+
+on:
+  create:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: template-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    # No-op in a template repository itself; meant for a generated copy.
+    if: ${{ !github.event.repository.is_template && (github.event_name != 'create' || github.event.ref_type == 'branch') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Strip template-only content
+        run: bash .github/scripts/template-init.sh
+
+      - name: Commit the cleanup if anything changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet && git diff --quiet --cached; then
+            echo "::notice::template already initialized; nothing to commit"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/adr .github/.template-initialized
+          git commit -m "chore: initialize from template (remove template docs/adr history)"
+          git push origin "HEAD:${{ github.ref_name }}"

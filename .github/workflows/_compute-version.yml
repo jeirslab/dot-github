@@ -1,0 +1,110 @@
+# .github/workflows/_compute-version.yml
+name: Compute Next Version & Changelog (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      tag_prefix:
+        type: string
+        default: "v"
+        required: false
+      bump_type:
+        type: string
+        default: "patch"
+        required: false
+      changelog_lines:
+        type: number
+        default: 20
+        required: false
+    outputs:
+      version:
+        value: ${{ jobs.compute.outputs.version }}
+      tag:
+        value: ${{ jobs.compute.outputs.tag }}
+      changelog:
+        value: ${{ jobs.compute.outputs.changelog }}
+
+permissions:
+  contents: read
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      changelog: ${{ steps.changelog.outputs.text }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute next version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="${{ inputs.tag_prefix }}"
+          bump="${{ inputs.bump_type }}"
+          
+          git fetch --tags --force
+          latest="$(git tag --list "${prefix}[0-9]*" --sort=-v:refname | head -n1 || true)"
+          
+          if [[ -z "$latest" ]]; then
+            next="1.0.0"
+          else
+            ver="${latest#${prefix}}"
+            if [[ ! "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "::error::Invalid version format: $latest"
+              exit 1
+            fi
+            major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
+            
+            case "$bump" in
+              major) major=$((major+1)); minor=0; patch=0 ;;
+              minor) minor=$((minor+1)); patch=0 ;;
+              patch) patch=$((patch+1)) ;;
+              *) echo "::error::Invalid bump: $bump"; exit 1 ;;
+            esac
+            
+            next="${major}.${minor}.${patch}"
+          fi
+          
+          new_tag="${prefix}${next}"
+          if git rev-parse "$new_tag" >/dev/null 2>&1; then
+            echo "::error::Tag $new_tag already exists"
+            exit 1
+          fi
+          
+          echo "version=$next" >> $GITHUB_OUTPUT
+          echo "tag=$new_tag" >> $GITHUB_OUTPUT
+          echo "::notice::Next version: $new_tag (bump: $bump)"
+
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="${{ inputs.tag_prefix }}"
+          lines="${{ inputs.changelog_lines }}"
+          
+          # The newest existing tag is the previous release (the next tag is not created yet).
+          prev_tag="$(git tag --list "${prefix}[0-9]*" --sort=-v:refname | head -n1 || true)"
+          
+          if [[ -z "$prev_tag" ]]; then
+            changelog="$(git log -n "$lines" --pretty=format:'- %s (%h)' --no-merges)"
+          else
+            changelog="$(git log "${prev_tag}..HEAD" --pretty=format:'- %s (%h)' --no-merges)"
+          fi
+          
+          {
+            echo "text<<EOF"
+            echo "$changelog"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+          
+          echo "::group::Changelog"
+          echo "$changelog"
+          echo "::endgroup::"

@@ -1,0 +1,41 @@
+name: Runner
+# Reusable picker for the trusted org-level jobs (ADR-011): outputs the label they run on.
+# ORG_RUNNER unset → ubuntu-latest; auto → the fleet label when an online runner carries it,
+# else hosted; any other value → that label. Always runs on a hosted runner itself.
+
+on:
+  workflow_call:
+    inputs:
+      fleet_label:
+        type: string
+        default: org-fleet
+        required: false
+    outputs:
+      label:
+        description: 'runs-on label for the trusted jobs'
+        value: ${{ jobs.pick.outputs.label }}
+    secrets:
+      ORG_ADMIN_TOKEN:
+        required: false
+      ORG_READ_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.p.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: claude/runner_pick.py
+          sparse-checkout-cone-mode: false
+      - id: p
+        env:
+          ORG_RUNNER: ${{ vars.ORG_RUNNER }}
+          ORG_ADMIN_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+          ORG_READ_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+        run: python3 claude/runner_pick.py --owner "$GITHUB_REPOSITORY_OWNER" --fleet-label "${{ inputs.fleet_label }}" --github-output

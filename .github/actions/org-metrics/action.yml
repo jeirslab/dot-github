@@ -1,0 +1,52 @@
+name: Org metrics
+description: >-
+  Ships one structured event about a workflow job to the org observability stack (ideas.md 24).
+  Posts a Loki push-API line to the URL in the ORG_METRICS_URL variable; a no-op when unset, so
+  it is safe to call from every job. Labels: org, repo, workflow, job, event, result.
+inputs:
+  event:
+    description: 'Event name (gate, guardrail-secrets, deploy, rollback-proposed, release, ai-tokens, ...)'
+    required: true
+  result:
+    description: 'Job result (success, failure, cancelled, skipped)'
+    required: true
+  extra:
+    description: 'Extra JSON object merged into the log line (e.g. {"tier":"full","tokens_in":123})'
+    required: false
+    default: '{}'
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        # Composite actions can read `env` but NOT `vars` (fails template validation).
+        # Unset → empty → the step no-ops below. To enable metrics, a caller exports
+        # ORG_METRICS_URL/TOKEN into the env (e.g. job-level `env:` from `vars.*`).
+        METRICS_URL: ${{ env.ORG_METRICS_URL }}
+        METRICS_TOKEN: ${{ env.ORG_METRICS_TOKEN }}
+        EVENT: ${{ inputs.event }}
+        RESULT: ${{ inputs.result }}
+        EXTRA: ${{ inputs.extra }}
+      run: |
+        set -uo pipefail
+        if [[ -z "${METRICS_URL:-}" ]]; then echo "org-metrics: ORG_METRICS_URL unset; skipping"; exit 0; fi
+        ts="$(date +%s%N)"
+        line="$(python3 - "$EXTRA" <<'EOF'
+        import json, os, sys
+        extra = {}
+        try: extra = json.loads(sys.argv[1] or "{}")
+        except Exception: pass
+        rec = {
+          "org": os.environ.get("GITHUB_REPOSITORY_OWNER"), "repo": os.environ.get("GITHUB_REPOSITORY"),
+          "workflow": os.environ.get("GITHUB_WORKFLOW"), "job": os.environ.get("GITHUB_JOB"),
+          "run_id": os.environ.get("GITHUB_RUN_ID"), "ref": os.environ.get("GITHUB_REF_NAME"),
+          "actor": os.environ.get("GITHUB_ACTOR"), "event_name": os.environ.get("GITHUB_EVENT_NAME"),
+          "event": os.environ["EVENT"], "result": os.environ["RESULT"], **extra,
+        }
+        print(json.dumps(rec, separators=(",", ":")))
+        EOF
+        )"
+        payload="$(python3 -c 'import json,sys,os; print(json.dumps({"streams":[{"stream":{"source":"org-workflows","org":os.environ.get("GITHUB_REPOSITORY_OWNER",""),"repo":os.environ.get("GITHUB_REPOSITORY",""),"event":os.environ["EVENT"],"result":os.environ["RESULT"]},"values":[[sys.argv[1],sys.argv[2]]]}]}))' "$ts" "$line")"
+        auth=(); [[ -n "${METRICS_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer $METRICS_TOKEN")
+        code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -H 'Content-Type: application/json' "${auth[@]}" -X POST "$METRICS_URL" --data "$payload" || echo 000)"
+        echo "org-metrics: $EVENT/$RESULT → $METRICS_URL ($code)"

@@ -1,0 +1,104 @@
+name: Repo Versioning (tags + latest)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: "Tag prefix"
+        default: "v"
+        required: false
+        type: string
+      create_release:
+        description: "Also create a GitHub Release"
+        default: true
+        required: false
+        type: boolean
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  compute:
+    name: Compute version and changelog
+    # Kill switch (INFRA-273) + feature-test mode (ADR-009): automatic triggers are inert until
+    # ORG_WORKFLOWS_ENABLED is 'true'; with ORG_FEAT_TEST 'true' only the feature-test branch runs
+    # (and org-wide actions are confined to this repo there). Manual dispatch always works.
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    uses: ./.github/workflows/_compute-version.yml
+    with:
+      # On push/release, github.event.inputs.prefix is empty → fall back to "v"
+      tag_prefix: ${{ github.event.inputs.prefix || 'v' }}
+      bump_type: patch
+      changelog_lines: 20
+
+  tag_and_release:
+    name: Tag and create release
+    needs: compute
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+
+      - name: Create version tag and move aliases
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.compute.outputs.tag }}"      # e.g. v1.0.2
+          VERSION="${TAG#v}"                          # 1.0.2
+          MAJOR="${VERSION%%.*}"                      # 1
+          MAJOR_TAG="v${MAJOR}"                       # v1
+
+          echo "Tag to create: $TAG"
+          echo "Major alias:   $MAJOR_TAG"
+
+          # Create/update the full semantic tag (v1.0.2)
+          git tag -fa "$TAG" -m "Release $TAG"
+          git push origin "refs/tags/$TAG" --force
+
+          # Move 'latest' alias to this commit
+          git push origin :refs/tags/latest || true
+          git tag -fa latest -m "Alias of $TAG"
+          git push origin refs/tags/latest --force
+
+          # Move major alias (v1, v2, ...) to this commit
+          git push origin :refs/tags/"$MAJOR_TAG" || true
+          git tag -fa "$MAJOR_TAG" -m "Latest $MAJOR_TAG line ($TAG)"
+          git push origin "refs/tags/$MAJOR_TAG" --force
+
+          echo "::notice::Tagged $TAG and updated aliases: latest, $MAJOR_TAG"
+
+      - name: Create GitHub Release
+        if: ${{ github.event.inputs.create_release != 'false' }}
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.compute.outputs.tag }}
+          name: Release ${{ needs.compute.outputs.tag }}
+          body: |
+            Automated version bump for workflow repo.
+
+            ### Changes
+            ${{ needs.compute.outputs.changelog }}
+          draft: false
+          prerelease: false
+
+      - name: Summary
+        run: |
+          echo "### Workflow Repo Versioning" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag**: ${{ needs.compute.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.compute.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Major Alias**: updated to match ${{ needs.compute.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **latest**: updated to match ${{ needs.compute.outputs.tag }}" >> $GITHUB_STEP_SUMMARY

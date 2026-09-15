@@ -1,0 +1,7 @@
+{
+  "name": "Org release (merge to main = release, artifact, production deploy)",
+  "description": "A PR merged into main/master tags a release, publishes the OCI artifact, and runs the production deploy behind the production environment. Reads org.toml. Pair with the Org pipeline template.",
+  "iconName": "rocket",
+  "categories": ["Deployment"],
+  "filePatterns": ["org.toml$"]
+}

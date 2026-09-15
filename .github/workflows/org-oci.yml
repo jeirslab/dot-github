@@ -1,0 +1,83 @@
+name: Org OCI Artifact
+# @doc: Reusable artifact publish (ideas.md 26). Builds the OCI image the caller's `org.toml` declares (`[artifacts.oci] attr`) with nix and pushes it to the declared registry as `<registry>/<owner>/<repo>:<tag>` (plus `:latest` on a release). The same Nix declaration that deploys a closure produces the image, so developers can `docker run` what production runs.
+# @doc: Call after the gate on the integration branch (tag = short SHA) and after a release (tag = the release tag). No `[artifacts.oci]` → no-op.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Image tag (default: short SHA)'
+        type: string
+        default: ''
+        required: false
+      also_latest:
+        type: boolean
+        default: false
+        required: false
+    secrets:
+      ORG_READ_TOKEN:
+        required: false
+      REGISTRY_USER:
+        required: false
+      REGISTRY_TOKEN:
+        description: 'Defaults to GITHUB_TOKEN for ghcr.io'
+        required: false
+    outputs:
+      image:
+        value: ${{ jobs.build.outputs.image }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: oci
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - id: plan
+        run: |
+          set -euo pipefail
+          attr="$(python3 .org/claude/orgfile.py . artifacts.oci.attr)"
+          if [[ -z "$attr" ]]; then echo "::notice::no [artifacts.oci] in org.toml; nothing to build"; echo "declared=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          registry="$(python3 .org/claude/orgfile.py . artifacts.oci.registry)"
+          name="$(python3 .org/claude/orgfile.py . artifacts.oci.name)"
+          name="${name:-$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')}"
+          tag="${{ inputs.tag }}"; tag="${tag:-${GITHUB_SHA::7}}"
+          { echo "declared=true"; echo "attr=$attr"; echo "registry=$registry"; echo "name=$name"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
+      - uses: DeterminateSystems/nix-installer-action@v16
+        if: steps.plan.outputs.declared == 'true'
+      - name: Build the image with nix
+        if: steps.plan.outputs.declared == 'true'
+        run: nix build ".#${{ steps.plan.outputs.attr }}" -o result-image --print-build-logs
+      - name: Push with skopeo
+        id: push
+        if: steps.plan.outputs.declared == 'true'
+        env:
+          REGISTRY: ${{ steps.plan.outputs.registry }}
+          NAME: ${{ steps.plan.outputs.name }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          ALSO_LATEST: ${{ inputs.also_latest }}
+          USER: ${{ secrets.REGISTRY_USER || github.actor }}
+          TOKEN: ${{ secrets.REGISTRY_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          nix run nixpkgs#skopeo -- login "$REGISTRY" -u "$USER" --password-stdin <<< "$TOKEN"
+          src="docker-archive:result-image"
+          [[ -d result-image ]] && src="oci:result-image"   # nix2container-style OCI directory
+          dest="$REGISTRY/$NAME:$TAG"
+          nix run nixpkgs#skopeo -- copy "$src" "docker://$dest"
+          [[ "$ALSO_LATEST" == "true" ]] && nix run nixpkgs#skopeo -- copy "$src" "docker://$REGISTRY/$NAME:latest"
+          echo "image=$dest" >> "$GITHUB_OUTPUT"
+          echo "::notice::pushed $dest"
+      - uses: ./.org/.github/actions/org-metrics
+        if: always()
+        with: { event: oci, result: "${{ job.status }}" }

@@ -1,0 +1,48 @@
+name: Generate Workflow Docs
+
+on:
+  push:
+    branches: [ main, feature-test ]
+    paths:
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    # Kill switch (INFRA-273) + feature-test mode (ADR-009): automatic triggers are inert until
+    # ORG_WORKFLOWS_ENABLED is 'true'; with ORG_FEAT_TEST 'true' only the feature-test branch runs
+    # (and org-wide actions are confined to this repo there). Manual dispatch always works.
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Generate docs
+        run: python .github/scripts/generate-workflow-docs.py
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet WORKFLOWS.md 2>/dev/null; then
+            echo "No changes to WORKFLOWS.md"
+          else
+            git config user.name "docs-bot"
+            git config user.email "docs-bot@users.noreply.github.com"
+            git add WORKFLOWS.md
+            git commit -m "docs: auto-generate workflow documentation"
+            git push origin main
+          fi

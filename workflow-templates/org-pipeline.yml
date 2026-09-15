@@ -1,0 +1,38 @@
+name: Org pipeline
+# Starter for consuming repositories (ADR-003). The job names `gate` and `guardrails` are
+# load-bearing: the org rulesets require the checks `gate / gate` and `guardrails / *`.
+# Replace <org> with the GitHub organization (the bootstrap workflow does this for you).
+
+on:
+  pull_request:
+    branches: [staging, main, master]
+  push:
+    branches: [staging]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  gate:
+    uses: <org>/.github/.github/workflows/org-gate.yml@v2
+    secrets: inherit
+
+  guardrails:
+    if: github.event_name == 'pull_request'
+    uses: <org>/.github/.github/workflows/org-guardrails.yml@v2
+    secrets: inherit
+
+  artifact:
+    if: github.event_name == 'push'
+    needs: gate
+    uses: <org>/.github/.github/workflows/org-oci.yml@v2
+    secrets: inherit
+
+  deploy-staging:
+    if: github.event_name == 'push'
+    needs: gate
+    uses: <org>/.github/.github/workflows/org-deploy.yml@v2
+    with:
+      environment: staging
+    secrets: inherit

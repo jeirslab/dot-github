@@ -1,0 +1,96 @@
+name: Org Branch Sweep
+# @doc: Branch ↔ ticket sweep (ADR-008, INFRA-278). Lists the branches of every repository in `claude/repos.txt` (or the whole org with `all`), extracts Jira keys from branch names, correlates them with ticket summary / status / assignee, and reports per owner what is pending merge — ahead/behind the integration branch, last-commit age, open PR, and flags (`merged`, `ticket-done`, `stale`, `no-ticket`, `unassigned`). Written to the job summary and an artifact; on the schedule (or `publish: issue`) it also refreshes the pinned issue labelled `branch-sweep` in this repository.
+# @doc: Needs a token that can read every swept repository (`ORG_SYNC_TOKEN` or `ORG_READ_TOKEN`; the default token only reads this one), plus `JIRA_EMAIL` / `JIRA_API_TOKEN` secrets and the `JIRA_BASE_URL` variable (or `[jira].base_url` in this repo's org.toml) for the ticket columns. Same script locally: `jira sweep` (subagent `org-branch-sweep`).
+
+on:
+  schedule:
+    - cron: '17 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: 'Comma-separated owner/name list (default: claude/repos.txt)'
+        type: string
+        default: ''
+      all:
+        description: 'Sweep every non-archived repository of the organization the token can see'
+        type: boolean
+        default: false
+      publish:
+        description: 'Where to publish besides the job summary'
+        type: choice
+        options: [summary-only, issue]
+        default: summary-only
+      offline:
+        description: 'Do not call Jira (ticket columns empty)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: org-branch-sweep
+  cancel-in-progress: false
+
+jobs:
+  runner:
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    uses: ./.github/workflows/_runner.yml
+    secrets: inherit
+
+  sweep:
+    needs: runner
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    runs-on: ${{ needs.runner.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sweep
+        env:
+          GH_TOKEN: ${{ secrets.ORG_SYNC_TOKEN || secrets.ORG_READ_TOKEN || github.token }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          REPOS: ${{ inputs.repos }}
+          ALL: ${{ inputs.all }}
+          OFFLINE: ${{ inputs.offline }}
+          ORG_FEAT_TEST: ${{ vars.ORG_FEAT_TEST }}
+          ORG_FEAT_TEST_BRANCH: ${{ vars.ORG_FEAT_TEST_BRANCH }}
+        run: |
+          set -euo pipefail
+          args=(--root . --format markdown --out sweep.md --json-out sweep.json)
+          t="$(python3 claude/targets.py --owner "$GITHUB_REPOSITORY_OWNER" --repos-file claude/repos.txt --repos "$REPOS")"
+          if [[ "$(echo "$t" | python3 -c 'import json,sys; print(json.load(sys.stdin)["feat_test"])')" == "True" ]]; then
+            args+=(--repos "$GITHUB_REPOSITORY")                                  # feature-test mode: this repo only
+          elif [[ "${ALL:-false}" == "true" ]]; then args+=(--all --org "$GITHUB_REPOSITORY_OWNER")
+          else args+=(--repos "$(echo "$t" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["repos"]))')"); fi
+          [[ "${OFFLINE:-false}" == "true" ]] && args+=(--offline)
+          if [[ -z "${JIRA_EMAIL:-}" || -z "${JIRA_API_TOKEN:-}" ]]; then
+            echo "::warning::JIRA_EMAIL / JIRA_API_TOKEN not set; ticket columns will be empty"
+          fi
+          python3 claude/jira/jira_cli.py sweep "${args[@]}" > /dev/null
+          cat sweep.md >> "$GITHUB_STEP_SUMMARY"
+          python3 -c 'import json; s=json.load(open("sweep.json"))["stats"]; print("::notice::" + f"{s[\"ticket_branches\"]} ticket branches, {s[\"unlinked_branches\"]} without a key, flags {s[\"flags\"]}")'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: branch-sweep
+          path: |
+            sweep.md
+            sweep.json
+      - name: Refresh the pinned sweep issue
+        if: github.event_name == 'schedule' || inputs.publish == 'issue'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create branch-sweep --description "Branch ↔ ticket sweep (ADR-008)" --color 5319E7 --force >/dev/null 2>&1 || true
+          num="$(gh issue list --repo "$GITHUB_REPOSITORY" --label branch-sweep --state open --json number --jq '.[0].number // empty')"
+          { echo "_Refreshed by \`org-branch-sweep.yml\` ([run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})). Comments on this issue are for humans; the body is overwritten on every run._"; echo; cat sweep.md; } > body.md
+          if [[ -n "$num" ]]; then
+            gh issue edit "$num" --repo "$GITHUB_REPOSITORY" --body-file body.md
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "Branch ↔ ticket sweep" --label branch-sweep --body-file body.md
+          fi
+      - uses: ./.github/actions/org-metrics
+        if: always()
+        with: { event: branch-sweep, result: "${{ job.status }}" }

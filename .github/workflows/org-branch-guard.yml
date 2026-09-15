@@ -1,0 +1,91 @@
+name: Org Branch Guard
+# @doc: Reusable detect-and-revert for deploy branches on plans without rulesets (ADR-007). On every push to a deploy branch it checks the new commit is the merge of a pull request; a direct push gets a revert PR, an issue naming the pusher, a metrics event, and never releases or deploys (the release and deploy workflows verify the same thing). Force-pushes are caught the same way.
+# @doc: Call from a consuming repo on `push: branches: [main, master]`. Needs `pull-requests: write` and `issues: write`.
+
+on:
+  workflow_call:
+    inputs:
+      revert:
+        description: 'Open a revert PR for direct pushes (false = report only)'
+        type: boolean
+        default: true
+        required: false
+    secrets:
+      ORG_READ_TOKEN:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  guard:
+    name: branch-guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          token: ${{ secrets.ORG_READ_TOKEN || github.token }}
+          path: .org
+      - name: Is this push the merge of a pull request?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCED: ${{ github.event.forced }}
+        run: |
+          set +e
+          python3 .org/claude/hooks/verify_pr.py --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --root . --min-approvals 0 --dump > facts.json
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "forced=$FORCED" >> "$GITHUB_OUTPUT"
+          cat facts.json | head -40
+          if [[ "$rc" == "3" || "$FORCED" == "true" ]]; then
+            echo "::error::direct or forced push to '${GITHUB_REF_NAME}' by @${GITHUB_ACTOR} — deploy branches are PR-only"
+            echo "violation=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "violation=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Revert PR + issue
+        if: steps.check.outputs.violation == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          REVERT: ${{ inputs.revert }}
+          FORCED: ${{ steps.check.outputs.forced }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git config user.name branch-guard; git config user.email branch-guard@users.noreply.github.com
+          branch="$GITHUB_REF_NAME"
+          gh label create policy-violation --repo "$GITHUB_REPOSITORY" --color b60205 --description "direct push to a deploy branch" 2>/dev/null || true
+          body="Direct${FORCED:+/forced} push to \`$branch\` by @${GITHUB_ACTOR}: \`${BEFORE:0:7}\` → \`${GITHUB_SHA:0:7}\` ([run](${RUN_URL})).
+
+          Deploy branches are PR-only (org rule; skill \`org-branching\`). This push will not release or deploy: the release and production-deploy workflows refuse commits that did not land through an approved, gated pull request. Open a PR from the integration branch instead."
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "Direct push to $branch by @${GITHUB_ACTOR} (${GITHUB_SHA:0:7})" --label policy-violation --body "$body" || true
+          if [[ "$REVERT" == "true" && -n "$BEFORE" && "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            rb="revert/${branch}-${GITHUB_SHA:0:7}"
+            git checkout -q -b "$rb" "$GITHUB_SHA"
+            # Restore the tree as it was before the push (handles multi-commit and forced pushes alike).
+            git rm -rq . && git checkout -q "$BEFORE" -- . && git add -A
+            if git diff --cached --quiet; then echo "nothing to revert (tree identical)"; exit 0; fi
+            git commit -q -m "Revert direct push to ${branch} (${GITHUB_SHA:0:7} → ${BEFORE:0:7})
+
+          Proposed by the org branch guard: ${RUN_URL}"
+            git push -u origin "$rb"
+            gh pr create --repo "$GITHUB_REPOSITORY" --base "$branch" --head "$rb" --label policy-violation \
+              --title "Revert direct push to ${branch} (${GITHUB_SHA:0:7})" \
+              --body "$body
+
+          Merging this restores \`$branch\` to \`${BEFORE:0:7}\`. If the pushed change is wanted, close this and re-land it through a pull request from the integration branch." || true
+          fi
+      - uses: ./.org/.github/actions/org-metrics
+        if: always()
+        with:
+          event: branch-guard
+          result: ${{ steps.check.outputs.violation == 'true' && 'violation' || 'ok' }}
+          extra: '{"actor":"${{ github.actor }}","forced":"${{ steps.check.outputs.forced }}"}'

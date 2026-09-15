@@ -1,0 +1,13 @@
+name: OCI Artifact
+# @org-managed: workflows — generated from org.toml [workflows].enabled by the org sync (ADR-004). Edit org.toml, not this file.
+# A no-op unless [artifacts.oci] is declared in org.toml.
+on:
+  push:
+    branches: [staging]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  oci:
+    uses: {{ORG_GITHUB}}/.github/.github/workflows/org-oci.yml@v2
+    secrets: inherit

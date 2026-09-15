@@ -1,0 +1,106 @@
+name: Simple Versioning (Reusable)
+# @doc: Reusable workflow for semantic versioning, tagging, and GitHub Release creation with flexible configuration.
+
+on:
+  workflow_call:
+    inputs:
+      tag_prefix:
+        description: "Optional tag prefix (e.g., v)"
+        type: string
+        default: "v"
+        required: false
+      bump:
+        description: "Which part to bump (patch only supported)"
+        type: string
+        default: "patch"
+        required: false
+      ref_to_tag:
+        description: "Ref to tag (default: current checkout)"
+        type: string
+        default: ""
+        required: false
+      create_release:
+        description: "Also create a GitHub Release"
+        type: boolean
+        default: true
+        required: false
+    outputs:
+      new_tag:
+        description: "Newly created version tag"
+        value: ${{ jobs.version.outputs.new_tag }}
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+
+      - name: Compute next version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="${{ inputs.tag_prefix }}"
+          git fetch --tags --force
+          latest="$(git tag --list "${prefix}[0-9]*" --sort=-v:refname | head -n1 || true)"
+          if [[ -z "$latest" ]]; then
+            next="1.0.0"
+          else
+            ver="${latest#${prefix}}"
+            if [[ ! "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "Unsupported existing tag format: $latest" >&2
+              exit 1
+            fi
+            major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
+            if [[ "$patch" -lt 9 ]]; then patch=$((patch+1)); else patch=0; minor=$((minor+1)); fi
+            next="${major}.${minor}.${patch}"
+          fi
+          echo "version=$next" >> $GITHUB_OUTPUT
+          echo "tag=${prefix}${next}" >> $GITHUB_OUTPUT
+
+      - name: Create/move version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          target="${{ inputs.ref_to_tag }}"
+          if [[ -n "$target" ]]; then
+            git fetch origin "$target" --depth=1 || true
+            sha="$(git rev-parse "$target")"
+            git tag -fa "$tag" -m "Release $tag" "$sha"
+          else
+            git tag -fa "$tag" -m "Release $tag"
+          fi
+          git push origin "refs/tags/$tag" --force
+
+      - name: Move 'latest' tag to this commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin :refs/tags/latest || true
+          git tag -fa latest -m "Alias of ${{ steps.ver.outputs.tag }}"
+          git push origin "refs/tags/latest" --force
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.ver.outputs.tag }}
+          name: Release ${{ steps.ver.outputs.tag }}
+          body: "Automated simple versioning release."
+          draft: false
+          prerelease: false

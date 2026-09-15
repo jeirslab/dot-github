@@ -1,0 +1,170 @@
+name: Org Bootstrap Repository
+# @doc: One-shot "make this repository conformant" (ideas.md 23). For a dispatched repository: seeds `staging`, applies the agent baseline (block, settings, MCP, skills, agents), writes a starter `org.toml`, `docs/adr/` skeleton, `flake.nix` on `lib.mkDevShell` and the org pipeline workflows where missing, generates CODEOWNERS, creates the standard labels, and opens one PR. Rulesets are applied when `ORG_ADMIN_TOKEN` exists. Idempotent; re-running on an old repository is the conformance fix.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'owner/repo to bootstrap'
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  runner:
+    uses: ./.github/workflows/_runner.yml
+    secrets: inherit
+
+  bootstrap:
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.label }}
+    steps:
+      - name: Token mode (ADR-014 — graceful when ORG_SYNC_TOKEN is absent)
+        env: { TOKEN: "${{ secrets.ORG_SYNC_TOKEN }}" }
+        run: |
+          if [[ -n "$TOKEN" ]]; then echo "::notice::Using ORG_SYNC_TOKEN."; else
+            echo "::warning::ORG_SYNC_TOKEN not set — using GITHUB_TOKEN, which reaches only ${{ github.repository }} and cannot push workflow files. Bootstrapping another repo needs a fine-grained PAT (yours, scoped to repos you own, or the org's) as ORG_SYNC_TOKEN."; fi
+      - uses: actions/checkout@v4
+        with: { path: source, fetch-depth: 0, fetch-tags: true }
+      - name: Feature-test mode confines bootstrap to this repository (ADR-009)
+        id: t
+        env:
+          ORG_FEAT_TEST: ${{ vars.ORG_FEAT_TEST }}
+          ORG_FEAT_TEST_BRANCH: ${{ vars.ORG_FEAT_TEST_BRANCH }}
+          REQUESTED: ${{ inputs.repo }}
+        run: |
+          set -euo pipefail
+          # Same-org confinement (ADR-014): a broad token cannot bootstrap another org's repo.
+          if [[ "${REQUESTED%%/*}" != "$GITHUB_REPOSITORY_OWNER" ]]; then
+            echo "::error::bootstrap target '$REQUESTED' is outside org '$GITHUB_REPOSITORY_OWNER' — refused (same-org confinement)"; exit 1
+          fi
+          t="$(python3 source/claude/targets.py --owner "$GITHUB_REPOSITORY_OWNER" --repos "$REQUESTED" --github-output)"
+          if [[ "$(echo "$t" | python3 -c 'import json,sys; print(json.load(sys.stdin)["feat_test"])')" == "True" && "$REQUESTED" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::ORG_FEAT_TEST is on: bootstrap may only target $GITHUB_REPOSITORY (requested $REQUESTED)"; exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ steps.t.outputs.ref }}
+          token: ${{ secrets.ORG_SYNC_TOKEN || github.token }}
+          path: target
+          fetch-depth: 0
+
+      - name: Seed the integration branch
+        working-directory: target
+        run: |
+          set -euo pipefail
+          # Robust default-branch resolution: origin/HEAD is not always a symbolic ref (INFRA-305).
+          default="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)"
+          if [ -z "$default" ]; then for b in main master; do if git show-ref -q --verify "refs/remotes/origin/$b"; then default="$b"; break; fi; done; fi
+          if [ -z "$default" ]; then default="$(git branch -r --format='%(refname:short)' | sed -n 's@^origin/@@p' | grep -v '^HEAD$' | head -1 || true)"; fi
+          if [ -z "$default" ]; then default="main"; fi
+          if git ls-remote --exit-code --heads origin staging >/dev/null 2>&1; then echo "staging exists"; else
+            if [[ "${{ inputs.dry_run }}" == "true" ]]; then echo "would create staging from $default"; else git push origin "refs/remotes/origin/${default}:refs/heads/staging"; fi
+          fi
+          git fetch origin && (git checkout -q staging 2>/dev/null || git checkout -q "$default")
+
+      - name: Apply the baseline and starters
+        env:
+          ORG: ${{ github.repository_owner }}
+          VERSION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          v="$(git -C source describe --tags --always --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || echo "$VERSION")"
+          python3 source/claude/sync.py apply --source source/claude --target target --version "$v" --org "$ORG"
+          cd target
+          [[ -f org.toml ]] || { python3 ../source/claude/orgfile.py --example > org.toml; echo "created org.toml (starter)"; }
+          if [[ ! -d docs/adr ]]; then
+            mkdir -p docs/adr
+            cp ../source/docs/adr/adr-template.md docs/adr/adr-template.md
+            printf '# Architecture Decision Records\n\nDecisions for this repository, numbered sequentially. Template: [adr-template.md](adr-template.md). Org-level decisions live in the org `.github` repository.\n\n| ADR | Title | Status |\n|-----|-------|--------|\n' > docs/adr/README.md
+            echo "created docs/adr/"
+          fi
+          if [[ ! -f flake.nix ]]; then
+            cat > flake.nix <<EOF
+          {
+            description = "Developer environment (org baseline + repo tools)";
+            inputs = {
+              nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+              org-baseline.url = "github:${ORG}/.github";
+              org-baseline.inputs.nixpkgs.follows = "nixpkgs";
+            };
+            outputs = { self, nixpkgs, org-baseline }:
+              let
+                systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
+                forAll = f: nixpkgs.lib.genAttrs systems (s: f nixpkgs.legacyPackages.\${s});
+              in {
+                devShells = forAll (pkgs: { default = org-baseline.lib.mkDevShell { inherit pkgs; extraPackages = [ ]; }; });
+              };
+          }
+          EOF
+            echo "created flake.nix (starter) — run 'nix flake lock' locally"
+          fi
+          mkdir -p .github/workflows
+          for t in org-pipeline org-release; do
+            if [[ ! -f ".github/workflows/$t.yml" ]]; then
+              sed "s/<org>/${ORG}/g" "../source/workflow-templates/$t.yml" > ".github/workflows/$t.yml"; echo "created .github/workflows/$t.yml"
+            fi
+          done
+          grep -qE '^\.env(\b|$)' .gitignore 2>/dev/null || { printf '\n# secrets come from Infisical (org baseline)\n.env\n.env.*\n!.env.example\n' >> .gitignore; }
+          python3 ../source/claude/hooks/gen_codeowners.py --root .
+          bash ../source/claude/org-check.sh . || true
+
+      - name: Standard labels
+        if: inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.ORG_SYNC_TOKEN }}
+          R: ${{ inputs.repo }}
+        run: |
+          set +e
+          while IFS='|' read -r name color desc; do
+            gh label create "$name" --repo "$R" --color "$color" --description "$desc" 2>/dev/null || gh label edit "$name" --repo "$R" --color "$color" --description "$desc" 2>/dev/null
+          done <<'EOF'
+          author:human|5319e7|provenance: human-authored commits
+          author:claude-code|5319e7|provenance: Claude Code session commits
+          author:lovable|5319e7|provenance: Lovable bot commits
+          author:alert-agent|5319e7|provenance: alert-response agent commits
+          author:bot|5319e7|provenance: dependency/org bot commits
+          author:mixed|5319e7|provenance: humans and agents both contributed
+          needs-adr|d93f0b|change under ADR-required paths without an ADR
+          needs-split|d93f0b|PR too large or spans several tickets
+          adr:not-needed|0e8a16|reviewer waived the ADR requirement (say why)
+          auto-merge|0e8a16|human-applied: merge staging → main when green
+          rollback|b60205|rollback proposal
+          automated|ededed|opened by an org workflow
+          EOF
+          exit 0
+
+      - name: Open the bootstrap PR
+        if: inputs.dry_run != true
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: target
+          token: ${{ secrets.ORG_SYNC_TOKEN || github.token }}
+          branch: chore/org-bootstrap
+          delete-branch: true
+          commit-message: "${{ vars.ORG_CHORE_TICKET || 'CHORE-000' }}: bootstrap org conformance (baseline, org.toml, ADRs, flake, pipeline, CODEOWNERS)"
+          author: org-config-sync <org-config-sync@users.noreply.github.com>
+          committer: org-config-sync <org-config-sync@users.noreply.github.com>
+          title: "${{ vars.ORG_CHORE_TICKET || 'CHORE-000' }}: bootstrap org conformance"
+          labels: automated
+          body: |
+            ## Org bootstrap
+
+            Brings this repository up to the org standard (ADR-003, ADR-005, ADR-006): `staging` seeded, agent baseline block + skills + subagents, starter `org.toml` (edit the gate and deploy commands!), `docs/adr/` skeleton, starter `flake.nix` on the org `mkDevShell` (run `nix flake lock` locally and commit `flake.lock`), org pipeline workflows, CODEOWNERS block, `.env` ignored.
+
+            Nothing here is org-name specific; `<org>` was rendered from the repository owner.
+
+      - name: Apply rulesets (if an admin token exists)
+        if: inputs.dry_run != true
+        env:
+          ORG_ADMIN_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+        run: |
+          if [[ -z "${ORG_ADMIN_TOKEN:-}" ]]; then echo "::notice::ORG_ADMIN_TOKEN unset; rulesets not applied (run org-rulesets.yml later)"; exit 0; fi
+          python3 source/claude/apply_rulesets.py --repos "${{ inputs.repo }}"

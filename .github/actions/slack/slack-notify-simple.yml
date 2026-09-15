@@ -1,0 +1,82 @@
+name: 'Slack Notify'
+description: 'Send a simple Slack notification with automatic context'
+
+inputs:
+  message:
+    description: 'Message to send to Slack'
+    required: true
+  channel:
+    description: 'Slack channel (include # prefix)'
+    required: false
+    default: '#deployments'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Send to Slack
+      shell: bash
+      env:
+        SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+        MESSAGE: ${{ inputs.message }}
+        CHANNEL: ${{ inputs.channel }}
+      run: |
+        # Check if webhook is configured
+        if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
+          echo "ℹ️  SLACK_WEBHOOK_URL not configured - skipping notification"
+          exit 0
+        fi
+        
+        # Determine color based on job status
+        # Check common failure indicators in message
+        if [[ "$MESSAGE" =~ (fail|error|❌|🚨) ]]; then
+          COLOR="danger"
+          EMOJI="❌"
+        elif [[ "$MESSAGE" =~ (warning|⚠️|cancelled) ]]; then
+          COLOR="warning"
+          EMOJI="⚠️"
+        elif [[ "$MESSAGE" =~ (success|complete|✅|🚀|📦) ]]; then
+          COLOR="good"
+          EMOJI="✅"
+        else
+          COLOR="#439FE0"
+          EMOJI="ℹ️"
+        fi
+        
+        # Get branch name (if in a branch context)
+        BRANCH="${GITHUB_REF#refs/heads/}"
+        if [[ "$BRANCH" == "$GITHUB_REF" ]]; then
+          BRANCH_TEXT=""
+        else
+          BRANCH_TEXT=" (\`$BRANCH\`)"
+        fi
+        
+        # Build workflow run link
+        RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+        
+        # Create payload
+        PAYLOAD=$(cat <<EOF
+{
+  "channel": "$CHANNEL",
+  "attachments": [{
+    "color": "$COLOR",
+    "text": "$MESSAGE",
+    "footer": "$GITHUB_REPOSITORY$BRANCH_TEXT • Triggered by @$GITHUB_ACTOR • <$RUN_URL|View Workflow>",
+    "footer_icon": "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+    "ts": $(date +%s)
+  }]
+}
+EOF
+)
+        
+        # Send to Slack
+        HTTP_CODE=$(curl -X POST "$SLACK_WEBHOOK_URL" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD" \
+          -s -o /dev/null -w "%{http_code}")
+        
+        if [[ "$HTTP_CODE" == "200" ]]; then
+          echo "$EMOJI Slack notification sent to $CHANNEL"
+        else
+          echo "⚠️  Failed to send notification (HTTP $HTTP_CODE)"
+          exit 1
+        fi

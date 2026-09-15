@@ -1,0 +1,41 @@
+name: Org Runner Smoke
+# @doc: Canary for the runner policy (ADR-011). Picks the runner exactly as the trusted org-level jobs do (`vars.ORG_RUNNER`: unset → hosted, `auto` → fleet when online, else the given label), then proves the job environment: where it ran, the tools the org workflows need (nix, python3, jq, gh), and that the `platform.github` stack renders there. Weekly, and dispatched by the runner bootstrap as its final step.
+
+on:
+  schedule:
+    - cron: '7 7 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  runner:
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    uses: ./.github/workflows/_runner.yml
+    secrets: inherit
+
+  smoke:
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+        if: runner.environment == 'github-hosted'
+      - name: Where and what
+        run: |
+          {
+            echo "## runner smoke"; echo
+            echo "- label: \`${{ needs.runner.outputs.label }}\`"
+            echo "- environment: \`${{ runner.environment }}\` · name: \`${{ runner.name }}\` · os: \`${{ runner.os }}/${{ runner.arch }}\`"
+            echo "- host: \`$(uname -a)\`"
+            echo "- nix: \`$(nix --version 2>/dev/null || echo missing)\`"
+            echo "- python3: \`$(python3 --version 2>&1)\` · jq: \`$(jq --version 2>/dev/null || echo missing)\` · gh: \`$(gh --version 2>/dev/null | head -1 || echo missing)\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: The org stack renders here
+        run: |
+          nix build .#platform-github --print-build-logs
+          python3 -c 'import json; d=json.load(open("result")); print({k: len(v) for k, v in d["resource"].items()})' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: No Docker socket on a fleet runner
+        if: runner.environment != 'github-hosted'
+        run: '[ ! -S /var/run/docker.sock ] && echo "ok: no docker socket" || { echo "::error::docker socket present on a fleet runner (ADR-011)"; exit 1; }'

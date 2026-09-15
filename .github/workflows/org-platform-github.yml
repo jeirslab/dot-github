@@ -1,0 +1,113 @@
+name: Org Platform GitHub
+# @doc: The org's GitHub configuration as code (ADR-010), run from this repository (ADR-011). On a PR touching `nix/github/**`, `claude/repos.txt` or `claude/rulesets/**` it renders the `platform.github` Terranix stack and posts the OpenTofu plan as a PR comment; on push to `main` it applies (kill-switched; feature-test mode plans only). State lives in the S3 bucket named by `ORG_TF_STATE_BUCKET` (apply refuses local state). Token from `ORG_ADMIN_TOKEN`; Actions secret values, if managed, from `ORG_TF_SECRETS` (JSON).
+# @doc: Runs on `vars.ORG_RUNNER` (the fleet runner label) when set, else `ubuntu-latest`; the Nix installer step only runs on hosted runners. Same command locally: `nix run .#platform-github -- plan`.
+
+on:
+  pull_request:
+    paths: ['nix/github/**', 'claude/repos.txt', 'claude/rulesets/**', 'flake.nix', 'flake.lock']
+  push:
+    branches: [main, feature-test]
+    paths: ['nix/github/**', 'claude/repos.txt', 'claude/rulesets/**', 'flake.nix', 'flake.lock']
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Apply after planning (main only, needs ORG_TF_STATE_BUCKET)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: org-platform-github
+  cancel-in-progress: false
+
+env:
+  ORG_TF_STATE_BUCKET: ${{ vars.ORG_TF_STATE_BUCKET }}
+  ORG_TF_STATE_KEY: ${{ vars.ORG_TF_STATE_KEY || 'tf/platform-github/terraform.tfstate' }}
+  ORG_TF_STATE_REGION: ${{ vars.ORG_TF_STATE_REGION || 'us-east-1' }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.ORG_TF_AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.ORG_TF_AWS_SECRET_ACCESS_KEY }}
+  TF_VAR_github_token: ${{ secrets.ORG_ADMIN_TOKEN }}
+  TF_VAR_org_secrets: ${{ secrets.ORG_TF_SECRETS || '{}' }}
+  NIX_CONFIG: 'experimental-features = nix-command flakes'
+
+jobs:
+  runner:
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    uses: ./.github/workflows/_runner.yml
+    secrets: inherit
+
+  plan:
+    needs: runner
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.ORG_FEAT_TEST == 'true' && (github.ref_name == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test') || github.base_ref == (vars.ORG_FEAT_TEST_BRANCH || 'feature-test'))) || (vars.ORG_FEAT_TEST != 'true' && vars.ORG_WORKFLOWS_ENABLED == 'true') }}
+    runs-on: ${{ needs.runner.outputs.label }}
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+        if: runner.environment == 'github-hosted'
+      - name: Render the stack
+        run: |
+          nix build .#platform-github --print-build-logs
+          python3 -c 'import json; d=json.load(open("result")); print("resources:", {k: len(v) for k, v in d["resource"].items()}); print("imports:", len(d.get("import", [])))' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Decide what this run may do
+        id: mode
+        run: |
+          set -euo pipefail
+          if [[ -z "${TF_VAR_github_token:-}" ]]; then echo "mode=validate" >> "$GITHUB_OUTPUT"; echo "::warning::ORG_ADMIN_TOKEN is not set; validating only"; exit 0; fi
+          if [[ -z "${ORG_TF_STATE_BUCKET:-}" ]]; then echo "::warning::ORG_TF_STATE_BUCKET is not set; planning against LOCAL (empty) state — the plan shows a full adopt, and apply is refused"; fi
+          echo "mode=plan" >> "$GITHUB_OUTPUT"
+      - name: Validate
+        if: steps.mode.outputs.mode == 'validate'
+        env: { ORG_TF_DIR: "${{ runner.temp }}/platform-github" }
+        run: nix run .#platform-github -- validate -no-color
+      - name: Plan
+        if: steps.mode.outputs.mode == 'plan'
+        env: { ORG_TF_DIR: "${{ runner.temp }}/platform-github" }
+        run: |
+          set -o pipefail
+          nix run .#platform-github -- plan -no-color -detailed-exitcode -out=plan.tfplan 2>&1 | tee plan.txt; rc=${PIPESTATUS[0]}
+          case $rc in 0) echo "changes=false" >> "$GITHUB_OUTPUT";; 2) echo "changes=true" >> "$GITHUB_OUTPUT";; *) exit $rc;; esac
+          { echo '## platform.github plan'; echo; echo '```'; tail -n 200 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: steps.mode.outputs.mode == 'plan'
+        with:
+          name: platform-github-plan
+          path: plan.txt
+      - name: Post the plan on the PR
+        if: github.event_name == 'pull_request' && steps.mode.outputs.mode == 'plan'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          marker='<!-- org-platform-github-plan -->'
+          { echo "$marker"; echo "### \`platform.github\` plan for $GITHUB_SHA"; echo; echo '```'; tail -n 150 plan.txt; echo '```'; echo; echo "_Rendered from \`nix/github/\` by \`org-platform-github.yml\` ([run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)). Merging to \`main\` applies it._"; } > body.md
+          existing="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)"
+          if [[ -n "$existing" ]]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F body=@body.md >/dev/null
+          else gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file body.md; fi
+
+  apply:
+    name: apply (main)
+    needs: [runner, plan]
+    if: needs.plan.outputs.mode == 'plan' && vars.ORG_FEAT_TEST != 'true' && ((github.event_name == 'push' && github.ref_name == 'main') || (github.event_name == 'workflow_dispatch' && inputs.apply == true && github.ref_name == 'main'))
+    runs-on: ${{ needs.runner.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+        if: runner.environment == 'github-hosted'
+      - name: Refuse to apply without remote state
+        run: |
+          if [[ -z "${ORG_TF_STATE_BUCKET:-}" ]]; then echo "::error::ORG_TF_STATE_BUCKET is not set; an apply with local state would be lost with the runner. Set the variable (and the AWS secrets) first."; exit 1; fi
+      - name: Apply
+        env: { ORG_TF_DIR: "${{ runner.temp }}/platform-github" }
+        run: |
+          set -o pipefail
+          nix run .#platform-github -- apply -no-color -auto-approve 2>&1 | tee apply.txt
+          { echo '## platform.github apply'; echo; echo '```'; tail -n 100 apply.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: ./.github/actions/org-metrics
+        if: always()
+        with: { event: platform-github-apply, result: "${{ job.status }}" }

@@ -1,0 +1,73 @@
+name: Seed Integration Branch
+# @doc: Creates the `staging` integration branch from the repository default branch (`main` or `master`) if it does not already exist. Idempotent; never modifies an existing branch.
+#
+# INFRA-270 — under the v2 branch model (ideas.md → Emerging decisions; ADR-002 R14) a
+# repository has exactly two long-lived branches: the deploy branch (`main`/`master`)
+# and `staging`. The v1 `dev`/`qa`/`prod` ladder is no longer seeded; leftovers are
+# reported, not deleted.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Integration branch to seed'
+        type: string
+        default: 'staging'
+        required: false
+  workflow_call:
+    inputs:
+      branch:
+        description: 'Integration branch to seed'
+        type: string
+        default: 'staging'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  seed:
+    name: Seed ${{ inputs.branch || 'staging' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create the integration branch if missing
+        env:
+          BRANCH: ${{ inputs.branch || 'staging' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin --prune
+
+          if [[ -z "$DEFAULT_BRANCH" ]]; then
+            # Robust: origin/HEAD is not always a symbolic ref (INFRA-305).
+            DEFAULT_BRANCH="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)"
+            if [ -z "$DEFAULT_BRANCH" ]; then for b in main master; do if git show-ref -q --verify "refs/remotes/origin/$b"; then DEFAULT_BRANCH="$b"; break; fi; done; fi
+            if [ -z "$DEFAULT_BRANCH" ]; then DEFAULT_BRANCH=main; fi
+          fi
+          if [[ "$DEFAULT_BRANCH" != "main" && "$DEFAULT_BRANCH" != "master" ]]; then
+            echo "::warning::Default branch is '$DEFAULT_BRANCH'; the v2 model expects main or master as the deploy branch."
+          fi
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::notice::'$BRANCH' already exists — nothing to do"
+          else
+            echo "::notice::Creating '$BRANCH' from origin/$DEFAULT_BRANCH"
+            git push origin "refs/remotes/origin/${DEFAULT_BRANCH}:refs/heads/${BRANCH}"
+          fi
+
+          for legacy in dev qa prod; do
+            if git ls-remote --exit-code --heads origin "$legacy" >/dev/null 2>&1; then
+              echo "::warning::Legacy v1 branch '$legacy' exists. It is not part of the v2 model (deploy branch + '$BRANCH'); retire it once nothing depends on it."
+            fi
+          done
+
+          {
+            echo "### Integration branch"
+            echo ""
+            echo "- **Deploy branch**: \`$DEFAULT_BRANCH\`"
+            echo "- **Integration branch**: \`$BRANCH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
